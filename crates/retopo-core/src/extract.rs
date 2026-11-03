@@ -247,7 +247,7 @@ fn one_ring(vertex_count: usize, tris: &[[u32; 3]]) -> Vec<Vec<u32>> {
 }
 
 /// Closed manifold input required for extraction.
-fn check_manifold(tris: &[[u32; 3]]) -> Result<(), RetopoError> {
+pub fn check_closed_manifold(tris: &[[u32; 3]]) -> Result<(), RetopoError> {
     let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
     for t in tris {
         for (i, j) in [(0, 1), (1, 2), (2, 0)] {
@@ -400,7 +400,7 @@ pub fn extract_mesh_with(
     scale: f64,
     options: &ExtractOptions,
 ) -> Result<ExtractedMesh, RetopoError> {
-    check_manifold(tris)?;
+    check_closed_manifold(tris)?;
     let n = positions.len();
     let inv_scale = 1.0 / scale;
     let mut stats = ExtractionStats {

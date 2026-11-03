@@ -98,6 +98,8 @@ jobs:
         run: $BLENDER_BIN -b --factory-startup -noaudio --python tools/headless_test.py
       - name: Extension validate & build
         run: |
+          cp LICENSE NOTICE.md open_retopo/
+          mkdir -p dist
           $BLENDER_BIN -b --factory-startup -noaudio --command extension validate open_retopo
           $BLENDER_BIN -b --factory-startup -noaudio --command extension build --source-dir open_retopo --output-dir dist
           ls -la dist
@@ -126,7 +128,10 @@ jobs:
           mkdir -p /tmp/blender && tar -xJf /tmp/blender.tar.xz -C /tmp/blender --strip-components=1
           echo "BLENDER_BIN=/tmp/blender/blender" >> "$GITHUB_ENV"
       - name: Build multi-platform extension
-        run: $BLENDER_BIN -b --factory-startup -noaudio --command extension build --source-dir open_retopo --output-dir dist
+        run: |
+          cp LICENSE NOTICE.md open_retopo/
+          mkdir -p dist
+          $BLENDER_BIN -b --factory-startup -noaudio --command extension build --source-dir open_retopo --output-dir dist
       - uses: actions/upload-artifact@v4
         with:
           name: open_retopo-multiplatform

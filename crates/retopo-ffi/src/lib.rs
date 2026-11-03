@@ -14,10 +14,18 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use openretopo_core::{remesh, RemeshOptions, RetopoError};
+use openretopo_core::{remesh, RemeshMode, RemeshOptions, RemeshStats, RetopoError};
 
 /// Bump when the ABI layout changes. Python asserts this on load.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2: polygon output (`out_face_sizes`), field-aligned mode by default,
+///     `flags` bit 0 selects the legacy decimator, stats carry
+///     `struct_size` and topology/pole fields.
+pub const ABI_VERSION: u32 = 2;
+
+/// `OpenRetopoParams::flags` bit: run the legacy weld + decimate pipeline
+/// instead of field-aligned remeshing.
+pub const FLAG_DECIMATE_ONLY: u32 = 1;
 pub const ERR_BUF_LEN: usize = 512;
 
 #[repr(C)]
@@ -26,7 +34,8 @@ pub struct OpenRetopoParams {
     /// `sizeof(OpenRetopoParams)` as seen by the caller. Must be >= 40;
     /// larger values (newer addons) are tolerated and the tail is ignored.
     pub struct_size: u32,
-    /// Target face count for the decimation pass. `0` disables it.
+    /// Target face count (field-aligned: lattice density, `0` = auto;
+    /// decimate: triangle budget, `0` = no decimation).
     pub target_faces: u32,
     /// Vertex welding epsilon. `<= 0.0` selects an automatic value.
     pub weld_epsilon: f32,
@@ -35,7 +44,7 @@ pub struct OpenRetopoParams {
     pub lock_crease_degrees: f32,
     /// Reserved for symmetry (0 = none, 1 = X, 2 = Y, 3 = Z). Unused today.
     pub symmetry_axis: u32,
-    /// Bitfield of reserved feature flags.
+    /// Feature flags, see `FLAG_*`.
     pub flags: u32,
     pub reserved: [u64; 2],
 }
@@ -57,6 +66,10 @@ impl Default for OpenRetopoParams {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct OpenRetopoStats {
+    /// `sizeof(OpenRetopoStats)` as seen by the caller; the library writes
+    /// at most this many bytes. Must be >= 8.
+    pub struct_size: u32,
+    pub _pad: u32,
     pub input_vertices: u64,
     pub input_faces: u64,
     pub welded_vertices_removed: u64,
@@ -68,14 +81,64 @@ pub struct OpenRetopoStats {
     pub target_reached: u64,
     pub output_vertices: u64,
     pub output_faces: u64,
+    pub quads: u64,
+    pub triangles: u64,
+    pub ngons: u64,
+    pub dropped_cycles: u64,
+    pub euler_input: i64,
+    pub euler_output: i64,
+    pub poles_valence3: u64,
+    pub poles_valence5: u64,
+    pub poles_other: u64,
+    pub subdivision_vertices_added: u64,
+    pub symmetry_deviation_x: f64,
+    pub edge_length: f64,
     pub duration_seconds: f64,
-    pub reserved: [u64; 3],
+    pub reserved: [u64; 4],
+}
+
+impl OpenRetopoStats {
+    fn from_core(s: &RemeshStats) -> Self {
+        OpenRetopoStats {
+            struct_size: std::mem::size_of::<OpenRetopoStats>() as u32,
+            _pad: 0,
+            input_vertices: s.input_vertices,
+            input_faces: s.input_faces,
+            welded_vertices_removed: s.welded_vertices_removed,
+            degenerate_faces_removed: s.degenerate_faces_removed,
+            duplicate_faces_removed: s.duplicate_faces_removed,
+            decimated_faces_removed: s.decimated_faces_removed,
+            collapses: s.collapses,
+            target_reached: s.target_reached as u64,
+            output_vertices: s.output_vertices,
+            output_faces: s.output_faces,
+            quads: s.quads,
+            triangles: s.triangles,
+            ngons: s.ngons,
+            dropped_cycles: s.dropped_cycles,
+            euler_input: s.euler_input,
+            euler_output: s.euler_output,
+            poles_valence3: s.poles_valence3,
+            poles_valence5: s.poles_valence5,
+            poles_other: s.poles_other,
+            subdivision_vertices_added: s.subdivision_vertices_added,
+            symmetry_deviation_x: s.symmetry_deviation_x,
+            edge_length: s.edge_length,
+            duration_seconds: s.duration_seconds,
+            reserved: [0; 4],
+        }
+    }
 }
 
 pub const OK: i32 = 0;
 pub const ERR_INVALID_ARG: i32 = 1;
 pub const ERR_CANCELLED: i32 = 2;
 pub const ERR_INTERNAL: i32 = 3;
+/// The input is valid but unsupported by the field-aligned path (open
+/// boundary, non-manifold edges) or the requested density is too high.
+pub const ERR_UNSUPPORTED_INPUT: i32 = 4;
+/// The solve or extraction failed its own validation; nothing was output.
+pub const ERR_REMESH_FAILED: i32 = 5;
 
 #[no_mangle]
 pub extern "C" fn openretopo_abi_version() -> u32 {
@@ -91,12 +154,16 @@ pub extern "C" fn openretopo_abi_version() -> u32 {
 ///   used.
 /// * `progress`, if non-null, is written with values in `0.0..=1.0`.
 /// * `cancel`, if non-null, is read; setting it to non-zero aborts the run.
-/// * `out_positions`/`out_indices` (and their length out-params) must be
-///   valid writable pointers.
+/// * `out_positions`/`out_indices`/`out_face_sizes` (and their length
+///   out-params) must be valid writable pointers. Faces are polygons:
+///   `out_face_sizes[k]` consecutive entries of `out_indices` form face k.
+/// * `out_stats`, if non-null, must be writable for its `struct_size` bytes.
 /// * `err_buf`, if non-null, must point to at least `ERR_BUF_LEN` writable
 ///   bytes.
 /// * On success the caller owns the returned buffers and must release them
-///   with [`openretopo_free_positions`] / [`openretopo_free_indices`].
+///   with [`openretopo_free_positions`] / [`openretopo_free_indices`]
+///   (the latter also frees `out_face_sizes`). On failure no buffers are
+///   allocated and the out-params are left untouched.
 #[no_mangle]
 pub unsafe extern "C" fn openretopo_remesh(
     positions: *const f32,
@@ -110,6 +177,8 @@ pub unsafe extern "C" fn openretopo_remesh(
     out_positions_len: *mut u64,
     out_indices: *mut *mut u32,
     out_indices_len: *mut u64,
+    out_face_sizes: *mut *mut u32,
+    out_face_sizes_len: *mut u64,
     out_stats: *mut OpenRetopoStats,
     err_buf: *mut c_char,
     err_buf_len: u64,
@@ -127,6 +196,8 @@ pub unsafe extern "C" fn openretopo_remesh(
             out_positions_len,
             out_indices,
             out_indices_len,
+            out_face_sizes,
+            out_face_sizes_len,
             out_stats,
             err_buf,
             err_buf_len,
@@ -158,6 +229,8 @@ unsafe fn remesh_impl(
     out_positions_len: *mut u64,
     out_indices: *mut *mut u32,
     out_indices_len: *mut u64,
+    out_face_sizes: *mut *mut u32,
+    out_face_sizes_len: *mut u64,
     out_stats: *mut OpenRetopoStats,
     err_buf: *mut c_char,
     err_buf_len: u64,
@@ -168,6 +241,8 @@ unsafe fn remesh_impl(
         || out_positions_len.is_null()
         || out_indices.is_null()
         || out_indices_len.is_null()
+        || out_face_sizes.is_null()
+        || out_face_sizes_len.is_null()
     {
         write_err(err_buf, err_buf_len, "null pointer argument");
         return ERR_INVALID_ARG;
@@ -199,10 +274,27 @@ unsafe fn remesh_impl(
         unsafe { *params }
     };
 
+    let stats_capacity = if out_stats.is_null() {
+        0usize
+    } else {
+        let declared = unsafe { (*out_stats).struct_size } as usize;
+        if declared < 8 {
+            write_err(err_buf, err_buf_len, "stats struct_size not set");
+            return ERR_INVALID_ARG;
+        }
+        declared.min(std::mem::size_of::<OpenRetopoStats>())
+    };
+
     let options = RemeshOptions {
+        mode: if params_value.flags & FLAG_DECIMATE_ONLY != 0 {
+            RemeshMode::Decimate
+        } else {
+            RemeshMode::FieldAligned
+        },
         target_faces: params_value.target_faces,
         weld_epsilon: params_value.weld_epsilon as f64,
         lock_crease_degrees: params_value.lock_crease_degrees as f64,
+        ..RemeshOptions::default()
     };
 
     // Progress/cancel trampolines bridging raw pointers into the core.
@@ -224,26 +316,22 @@ unsafe fn remesh_impl(
         Ok(output) => {
             let (pos_ptr, pos_len) = leak_boxed_slice(output.positions);
             let (idx_ptr, idx_len) = leak_boxed_slice(output.indices);
+            let (fs_ptr, fs_len) = leak_boxed_slice(output.face_sizes);
             unsafe {
                 *out_positions = pos_ptr;
                 *out_positions_len = pos_len as u64;
                 *out_indices = idx_ptr;
                 *out_indices_len = idx_len as u64;
-                if !out_stats.is_null() {
-                    *out_stats = OpenRetopoStats {
-                        input_vertices: output.stats.input_vertices,
-                        input_faces: output.stats.input_faces,
-                        welded_vertices_removed: output.stats.welded_vertices_removed,
-                        degenerate_faces_removed: output.stats.degenerate_faces_removed,
-                        duplicate_faces_removed: output.stats.duplicate_faces_removed,
-                        decimated_faces_removed: output.stats.decimated_faces_removed,
-                        collapses: output.stats.collapses,
-                        target_reached: output.stats.target_reached as u64,
-                        output_vertices: output.stats.output_vertices,
-                        output_faces: output.stats.output_faces,
-                        duration_seconds: output.stats.duration_seconds,
-                        reserved: [0; 3],
-                    };
+                *out_face_sizes = fs_ptr;
+                *out_face_sizes_len = fs_len as u64;
+                if stats_capacity > 0 {
+                    let mut value = OpenRetopoStats::from_core(&output.stats);
+                    value.struct_size = stats_capacity as u32;
+                    ptr::copy_nonoverlapping(
+                        &value as *const OpenRetopoStats as *const u8,
+                        out_stats as *mut u8,
+                        stats_capacity,
+                    );
                 }
             }
             OK
@@ -252,9 +340,21 @@ unsafe fn remesh_impl(
             write_err(err_buf, err_buf_len, "cancelled");
             ERR_CANCELLED
         }
+        Err(
+            e @ (RetopoError::UnsupportedBoundary
+            | RetopoError::NonManifoldInput
+            | RetopoError::TooDense { .. }),
+        ) => {
+            write_err(err_buf, err_buf_len, &e.to_string());
+            ERR_UNSUPPORTED_INPUT
+        }
+        Err(e @ (RetopoError::FieldDiverged | RetopoError::ExtractionInvalid(_))) => {
+            write_err(err_buf, err_buf_len, &e.to_string());
+            ERR_REMESH_FAILED
+        }
         Err(e) => {
             write_err(err_buf, err_buf_len, &e.to_string());
-            ERR_INTERNAL
+            ERR_INVALID_ARG
         }
     }
 }

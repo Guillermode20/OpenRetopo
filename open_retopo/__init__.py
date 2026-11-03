@@ -5,9 +5,11 @@ is a thin shell that:
   1. extracts triangle data from the active mesh (fast foreach_get path),
   2. hands it to the native engine on a worker thread (or synchronously when
      `sync=True` is passed, used by headless tests),
-  3. rebuilds the result as a new object.
+  3. rebuilds the result (quad-dominant polygons) as a new `<name>_retopo`
+     object, smooth shaded.
 
-The original object is never modified.
+The original object is never modified. If the engine fails, or the result
+does not pass Blender's own mesh validation, nothing is created.
 """
 
 import ctypes
@@ -18,7 +20,7 @@ import threading
 import numpy as np
 
 import bpy
-from bpy.props import BoolProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 EXT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +37,8 @@ _LIB_SPECS = {
     ("darwin", "arm64"): ("macos_universal2", "libopenretopo.dylib"),
 }
 
-EXPECTED_ABI = 1
+EXPECTED_ABI = 2
+FLAG_DECIMATE_ONLY = 1
 
 
 class OpenRetopoParams(ctypes.Structure):
@@ -52,6 +55,8 @@ class OpenRetopoParams(ctypes.Structure):
 
 class OpenRetopoStats(ctypes.Structure):
     _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
         ("input_vertices", ctypes.c_uint64),
         ("input_faces", ctypes.c_uint64),
         ("welded_vertices_removed", ctypes.c_uint64),
@@ -62,9 +67,23 @@ class OpenRetopoStats(ctypes.Structure):
         ("target_reached", ctypes.c_uint64),
         ("output_vertices", ctypes.c_uint64),
         ("output_faces", ctypes.c_uint64),
+        ("quads", ctypes.c_uint64),
+        ("triangles", ctypes.c_uint64),
+        ("ngons", ctypes.c_uint64),
+        ("dropped_cycles", ctypes.c_uint64),
+        ("euler_input", ctypes.c_int64),
+        ("euler_output", ctypes.c_int64),
+        ("poles_valence3", ctypes.c_uint64),
+        ("poles_valence5", ctypes.c_uint64),
+        ("poles_other", ctypes.c_uint64),
+        ("subdivision_vertices_added", ctypes.c_uint64),
+        ("symmetry_deviation_x", ctypes.c_double),
+        ("edge_length", ctypes.c_double),
         ("duration_seconds", ctypes.c_double),
-        ("reserved", ctypes.c_uint64 * 3),
+        ("reserved", ctypes.c_uint64 * 4),
     ]
+
+_STAT_FIELDS = [name for name, _ in OpenRetopoStats._fields_ if not name.startswith("_") and name not in ("struct_size", "reserved")]
 
 
 class _NativeShared(ctypes.Structure):
@@ -127,6 +146,8 @@ def _load_library():
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(pi),
         ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(pi),          # face sizes
+        ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(OpenRetopoStats),
         ctypes.POINTER(ctypes.c_char),
         ctypes.c_uint64,
@@ -158,8 +179,11 @@ def _extract_triangles(mesh):
     return positions, indices
 
 
-def _native_remesh(positions, indices, target_faces, progress=None, cancel=None):
-    """Call the engine. Returns (out_positions f32[:,3], out_indices u32[:,3], stats dict)."""
+def _native_remesh(positions, indices, target_faces, progress=None, decimate_only=False):
+    """Call the engine.
+
+    Returns (positions f32[:,3], face_sizes u32[F], indices u32[sum(sizes)], stats dict).
+    """
     lib = _load_library()
     pf, pi = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint32)
 
@@ -169,14 +193,17 @@ def _native_remesh(positions, indices, target_faces, progress=None, cancel=None)
     params.weld_epsilon = 0.0  # auto
     params.lock_crease_degrees = 180.0  # disabled for now (M1+ will expose)
     params.symmetry_axis = 0
-    params.flags = 0
+    params.flags = FLAG_DECIMATE_ONLY if decimate_only else 0
     params.reserved = (ctypes.c_uint64 * 2)(0, 0)
 
     out_pos = pf()
     out_idx = pi()
     out_pos_len = ctypes.c_uint64(0)
     out_idx_len = ctypes.c_uint64(0)
+    out_fs = pi()
+    out_fs_len = ctypes.c_uint64(0)
     stats = OpenRetopoStats()
+    stats.struct_size = ctypes.sizeof(OpenRetopoStats)
     err_buf = ctypes.create_string_buffer(512)
 
     progress_arg = None
@@ -197,6 +224,8 @@ def _native_remesh(positions, indices, target_faces, progress=None, cancel=None)
         ctypes.byref(out_pos_len),
         ctypes.byref(out_idx),
         ctypes.byref(out_idx_len),
+        ctypes.byref(out_fs),
+        ctypes.byref(out_fs_len),
         ctypes.byref(stats),
         err_buf,
         ctypes.c_uint64(len(err_buf)),
@@ -207,41 +236,48 @@ def _native_remesh(positions, indices, target_faces, progress=None, cancel=None)
 
     n_pos = out_pos_len.value
     n_idx = out_idx_len.value
-    pos = np.ctypeslib.as_array(out_pos, shape=(n_pos,)).copy().reshape(-1, 3)
-    tri = np.ctypeslib.as_array(out_idx, shape=(n_idx,)).copy().reshape(-1, 3)
-    lib.openretopo_free_positions(out_pos, n_pos)
-    lib.openretopo_free_indices(out_idx, n_idx)
+    n_fs = out_fs_len.value
+    try:
+        pos = np.ctypeslib.as_array(out_pos, shape=(n_pos,)).copy().reshape(-1, 3)
+        idx = np.ctypeslib.as_array(out_idx, shape=(n_idx,)).copy()
+        sizes = np.ctypeslib.as_array(out_fs, shape=(n_fs,)).copy() if n_fs else np.empty(0, np.uint32)
+    finally:
+        lib.openretopo_free_positions(out_pos, n_pos)
+        lib.openretopo_free_indices(out_idx, n_idx)
+        lib.openretopo_free_indices(out_fs, n_fs)
 
-    return pos, tri, {
-        "input_vertices": stats.input_vertices,
-        "input_faces": stats.input_faces,
-        "welded_vertices_removed": stats.welded_vertices_removed,
-        "degenerate_faces_removed": stats.degenerate_faces_removed,
-        "duplicate_faces_removed": stats.duplicate_faces_removed,
-        "decimated_faces_removed": stats.decimated_faces_removed,
-        "collapses": stats.collapses,
-        "target_reached": bool(stats.target_reached),
-        "output_vertices": stats.output_vertices,
-        "output_faces": stats.output_faces,
-        "duration_seconds": stats.duration_seconds,
-    }
+    if int(sizes.sum()) != idx.size or (idx.size and int(idx.max()) >= len(pos)) or not np.isfinite(pos).all():
+        raise NativeRetopologyError("engine returned inconsistent buffers (refusing to build a mesh)")
+
+    out = {name: getattr(stats, name) for name in _STAT_FIELDS}
+    out["target_reached"] = bool(stats.target_reached)
+    return pos, sizes, idx, out
 
 
 # ---------------------------------------------------------------------------
 # output object creation (main thread only)
 # ---------------------------------------------------------------------------
 
-def _create_output_object(context, source, positions, indices, suffix="_retopo"):
+def _create_output_object(context, source, positions, face_sizes, indices, suffix="_retopo"):
+    """Build the result object. Raises NativeRetopologyError (and leaves no
+    trace in bpy.data) if Blender's validator would have to repair it."""
+    starts = np.concatenate(([0], np.cumsum(face_sizes)[:-1])).astype(np.int64)
+    faces = [indices[s:s + n].tolist() for s, n in zip(starts.tolist(), face_sizes.tolist())]
     mesh = bpy.data.meshes.new(source.name + suffix)
-    verts = positions.astype(np.float32).tolist()
-    faces = indices.astype(np.int32).tolist() if indices.dtype != np.int32 else indices.tolist()
-    mesh.from_pydata(verts, [], faces)
+    mesh.from_pydata(positions.astype(np.float32).tolist(), [], faces)
+    if mesh.validate(verbose=False, clean_customdata=False):
+        bpy.data.meshes.remove(mesh)
+        raise NativeRetopologyError("result failed Blender mesh validation (nothing was created)")
     mesh.update()
-    for poly in mesh.polygons:
-        poly.use_smooth = True
+    if hasattr(mesh, "shade_smooth"):  # Blender 4.1+
+        mesh.shade_smooth()
+    else:
+        for poly in mesh.polygons:
+            poly.use_smooth = True
 
     obj = bpy.data.objects.new(source.name + suffix, mesh)
-    context.scene.collection.objects.link(obj)
+    for coll in source.users_collection or (context.scene.collection,):
+        coll.objects.link(obj)
     obj.matrix_world = source.matrix_world.copy()
 
     for o in context.selected_objects:
@@ -271,6 +307,14 @@ class OPENRETOPO_OT_remesh(Operator):
         min=100,
         max=1_000_000,
         description="Approximate face count of the output (hero-asset range recommended)",
+    )
+    mode: EnumProperty(
+        name="Mode",
+        items=(
+            ("FIELD", "Field-Aligned Quads", "Quad-dominant, field-aligned remesh (closed meshes)"),
+            ("DECIMATE", "Decimate (legacy)", "Weld + triangle decimation, works on open meshes"),
+        ),
+        default="FIELD",
     )
     sync: BoolProperty(
         name="Run Synchronously",
@@ -313,7 +357,11 @@ class OPENRETOPO_OT_remesh(Operator):
     def _worker(self):
         try:
             result = _native_remesh(
-                self._positions, self._indices, self.target_faces, progress=self._shared
+                self._positions,
+                self._indices,
+                self.target_faces,
+                progress=self._shared,
+                decimate_only=self.mode == "DECIMATE",
             )
             self._queue.put(("ok", result))
         except Exception as exc:
@@ -321,27 +369,40 @@ class OPENRETOPO_OT_remesh(Operator):
 
     def _finish_sync(self, context):
         try:
-            pos, idx, stats = _native_remesh(
-                self._positions, self._indices, self.target_faces
+            result = _native_remesh(
+                self._positions, self._indices, self.target_faces, decimate_only=self.mode == "DECIMATE"
             )
         except NativeRetopologyError as exc:
             self.report({"ERROR"}, f"OpenRetopo: {exc}")
             return {"CANCELLED"}
-        return self._create(context, pos, idx, stats)
+        return self._create(context, *result)
 
-    def _create(self, context, pos, idx, stats):
-        obj = _create_output_object(context, self._source, pos, idx)
-        msg = (
-            f"OpenRetopo: {stats['output_faces']} faces "
-            f"(welded {stats['welded_vertices_removed']}, "
-            f"degenerate {stats['degenerate_faces_removed']}, "
-            f"collapses {stats['collapses']}) in {stats['duration_seconds']:.2f}s"
-        )
-        if not stats["target_reached"]:
-            msg += " — target not fully reached (locked boundary/crease edges)"
+    def _create(self, context, pos, sizes, idx, stats):
+        global OPENRETOPO_LAST_STATS
+        OPENRETOPO_LAST_STATS = None
+        try:
+            obj = _create_output_object(context, self._source, pos, sizes, idx)
+        except NativeRetopologyError as exc:
+            self.report({"ERROR"}, f"OpenRetopo: {exc}")
+            return {"CANCELLED"}
+        if self.mode == "FIELD":
+            msg = (
+                f"OpenRetopo: {stats['output_faces']} faces "
+                f"({stats['quads']} quads, {stats['triangles']} tris), "
+                f"poles v3/v5/other {stats['poles_valence3']}/{stats['poles_valence5']}/{stats['poles_other']} "
+                f"in {stats['duration_seconds']:.2f}s"
+            )
+        else:
+            msg = (
+                f"OpenRetopo: {stats['output_faces']} faces "
+                f"(welded {stats['welded_vertices_removed']}, "
+                f"degenerate {stats['degenerate_faces_removed']}, "
+                f"collapses {stats['collapses']}) in {stats['duration_seconds']:.2f}s"
+            )
+            if not stats["target_reached"]:
+                msg += " — target not fully reached (locked boundary/crease edges)"
         self.report({"INFO"}, msg)
         print("[OpenRetopo]", msg, "->", obj.name)
-        global OPENRETOPO_LAST_STATS
         OPENRETOPO_LAST_STATS = dict(stats)
         OPENRETOPO_LAST_STATS["output_object"] = obj.name
         return {"FINISHED"}
@@ -368,8 +429,7 @@ class OPENRETOPO_OT_remesh(Operator):
         if kind == "err":
             self.report({"ERROR"}, f"OpenRetopo: {payload}")
             return {"CANCELLED"}
-        pos, idx, stats = payload
-        return self._create(context, pos, idx, stats)
+        return self._create(context, *payload)
 
     def execute(self, context):
         # Fallback entry point (e.g. from Python scripts); behaves like sync.
@@ -378,11 +438,13 @@ class OPENRETOPO_OT_remesh(Operator):
             positions, indices = _extract_triangles(obj.data)
             self._source = obj
             self._source_name = obj.name
-            pos, idx, stats = _native_remesh(positions, indices, self.target_faces)
+            result = _native_remesh(
+                positions, indices, self.target_faces, decimate_only=self.mode == "DECIMATE"
+            )
         except NativeRetopologyError as exc:
             self.report({"ERROR"}, f"OpenRetopo: {exc}")
             return {"CANCELLED"}
-        return self._create(context, pos, idx, stats)
+        return self._create(context, *result)
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +474,7 @@ class OPENRETOPO_PT_main(Panel):
 
         col.prop(scene_props, "target_faces")
         col.separator()
-        col.label(text="M0 build: weld + decimate pass.", icon="ERROR")
-        col.label(text="Field-aligned quading lands next.", icon="INFO")
+        col.label(text="Closed meshes only (no holes).", icon="INFO")
 
 
 class OPENRETOPO_SceneProps(PropertyGroup):

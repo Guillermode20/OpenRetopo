@@ -41,28 +41,46 @@ pub enum RetopoError {
     NonManifoldInput,
     #[error("quad extraction produced an invalid mesh: {0}")]
     ExtractionInvalid(String),
+    #[error("target face count is too high for this input: the refined working mesh would exceed {limit} vertices")]
+    TooDense { limit: usize },
+}
+
+/// Which pipeline [`remesh`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemeshMode {
+    /// Field-aligned quad-dominant remeshing (orientation field → position
+    /// field → extraction). Requires a closed, edge-manifold input.
+    #[default]
+    FieldAligned,
+    /// Legacy M0 path: weld + quadric decimation, triangle output.
+    Decimate,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct RemeshOptions {
-    /// Target face count for the decimation pass. `0` disables decimation.
-    /// Note: this is a decimator, not yet the field-aligned remesher — the
-    /// quad extraction pass lands in M3.
+    pub mode: RemeshMode,
+    /// Target face count. Field-aligned: sets the lattice spacing
+    /// `sqrt(area / target_faces)`; `0` picks `input_vertices / 16`.
+    /// Decimate: target triangle count, `0` disables decimation.
     pub target_faces: u32,
     /// Vertex welding distance. `<= 0.0` selects an automatic value derived
     /// from the bounding-box diagonal.
     pub weld_epsilon: f64,
-    /// Edges whose adjacent face normals differ by more than this angle
-    /// (degrees) are locked against collapse. `180.0` disables crease locking.
+    /// Decimate only: edges whose adjacent face normals differ by more than
+    /// this angle (degrees) are locked against collapse. `180.0` disables.
     pub lock_crease_degrees: f64,
+    /// Safety cap on the refined working mesh (field-aligned mode).
+    pub max_working_vertices: usize,
 }
 
 impl Default for RemeshOptions {
     fn default() -> Self {
         RemeshOptions {
+            mode: RemeshMode::FieldAligned,
             target_faces: 0,
             weld_epsilon: 0.0,
             lock_crease_degrees: 180.0,
+            max_working_vertices: 4_000_000,
         }
     }
 }
@@ -83,6 +101,27 @@ pub struct RemeshStats {
     pub target_reached: bool,
     pub output_vertices: u64,
     pub output_faces: u64,
+    /// Field-aligned output composition.
+    pub quads: u64,
+    pub triangles: u64,
+    pub ngons: u64,
+    /// Hole loops that could not be closed (always 0 on success).
+    pub dropped_cycles: u64,
+    /// Euler characteristic of the cleaned input and of the output.
+    pub euler_input: i64,
+    pub euler_output: i64,
+    /// Output vertices by valence: 3, 5, and anything else ≠ 4.
+    pub poles_valence3: u64,
+    pub poles_valence5: u64,
+    pub poles_other: u64,
+    /// Mean distance from each mirrored (x → −x) output vertex to the
+    /// nearest output vertex, in units of the target edge length. ~0 for a
+    /// perfectly X-symmetric result; only meaningful for symmetric input.
+    pub symmetry_deviation_x: f64,
+    /// Target edge length used by the field solve (0 in decimate mode).
+    pub edge_length: f64,
+    /// Vertices added by the pre-solve refinement.
+    pub subdivision_vertices_added: u64,
     pub duration_seconds: f64,
 }
 
@@ -90,7 +129,9 @@ pub struct RemeshStats {
 pub struct RemeshOutput {
     /// Interleaved xyz triplets, `f32` for direct hand-off to Blender.
     pub positions: Vec<f32>,
-    /// One triangle per face, `u32` indices.
+    /// Vertex count of each face (3 or 4 today).
+    pub face_sizes: Vec<u32>,
+    /// Concatenated face vertex indices, `face_sizes` gives the split.
     pub indices: Vec<u32>,
     pub stats: RemeshStats,
 }
@@ -179,6 +220,21 @@ pub fn remesh(
         }
     }
 
+    if options.mode == RemeshMode::FieldAligned {
+        return field_aligned(
+            verts,
+            tris,
+            options,
+            progress,
+            start,
+            input_vertices,
+            input_faces,
+            merged,
+            degenerate_removed,
+            duplicates_removed,
+        );
+    }
+
     // ---- optional decimation ----------------------------------------------
     let mut decimated_faces_removed = 0u64;
     let mut collapses = 0u64;
@@ -247,6 +303,7 @@ pub fn remesh(
 
     Ok(RemeshOutput {
         positions: out_positions,
+        face_sizes: vec![3; tris.len()],
         indices: out_indices,
         stats: RemeshStats {
             input_vertices,
@@ -259,7 +316,184 @@ pub fn remesh(
             target_reached,
             output_vertices,
             output_faces,
+            triangles: output_faces,
+            euler_input: field::euler_characteristic(verts.len(), &tris),
+            euler_output: field::euler_characteristic(verts.len(), &tris),
             duration_seconds: start.elapsed().as_secs_f64(),
+            ..RemeshStats::default()
         },
     })
+}
+
+fn report(progress: &mut Option<&mut dyn FnMut(f32) -> bool>, t: f32) -> Result<(), RetopoError> {
+    if let Some(p) = progress.as_mut() {
+        if p(t) {
+            return Err(RetopoError::Cancelled);
+        }
+    }
+    Ok(())
+}
+
+/// Field-aligned pipeline on an already welded/cleaned mesh.
+#[allow(clippy::too_many_arguments)]
+fn field_aligned(
+    mut verts: Vec<[f64; 3]>,
+    mut tris: Vec<[u32; 3]>,
+    options: &RemeshOptions,
+    mut progress: Option<&mut dyn FnMut(f32) -> bool>,
+    start: Instant,
+    input_vertices: u64,
+    input_faces: u64,
+    merged: usize,
+    degenerate_removed: u64,
+    duplicates_removed: u64,
+) -> Result<RemeshOutput, RetopoError> {
+    // fail fast, before any expensive work, on inputs extraction rejects
+    extract::check_closed_manifold(&tris)?;
+    let euler_input = field::euler_characteristic(verts.len(), &tris);
+
+    let area = field::surface_area(&verts, &tris);
+    let target = if options.target_faces > 0 {
+        options.target_faces
+    } else {
+        ((verts.len() / 16).max(1)) as u32
+    };
+    let scale = (area / target as f64).sqrt();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(RetopoError::AllFacesRemoved);
+    }
+
+    // ---- refine so the input can carry the lattice -----------------------
+    let before = verts.len();
+    let avg = subdivide::average_edge_length(&verts, &tris);
+    subdivide::subdivide_long_edges(
+        &mut verts,
+        &mut tris,
+        (scale * 0.5).min(avg * 2.0),
+        options.max_working_vertices,
+    )
+    .ok_or(RetopoError::TooDense {
+        limit: options.max_working_vertices,
+    })?;
+    let subdivision_vertices_added = (verts.len() - before) as u64;
+    report(&mut progress, 0.30)?;
+
+    // ---- fields ----------------------------------------------------------
+    let fopts = field::FieldOptions::default();
+    let (orient, _) = field::solve_orientation(&verts, &tris, &fopts)?;
+    report(&mut progress, 0.55)?;
+    let pf = field::solve_position(&verts, &tris, &orient, target, &fopts)?;
+    report(&mut progress, 0.80)?;
+
+    // ---- extraction (validates closed manifold + Euler invariance) -------
+    let mesh = extract::extract_mesh(
+        &verts,
+        &tris,
+        &orient.directions,
+        &orient.normals,
+        &pf.anchors,
+        pf.scale,
+    )?;
+    report(&mut progress, 0.97)?;
+
+    let es = &mesh.stats;
+    let mut valence = vec![0u32; mesh.positions.len()];
+    let mut face_sizes = Vec::with_capacity(mesh.faces.len());
+    let mut indices = Vec::with_capacity(mesh.faces.len() * 4);
+    for f in &mesh.faces {
+        face_sizes.push(f.len() as u32);
+        for &v in f {
+            valence[v as usize] += 1;
+            indices.push(v);
+        }
+    }
+    let ngons = mesh.faces.iter().filter(|f| f.len() > 4).count() as u64;
+    let positions: Vec<f32> = mesh.positions.iter().flatten().copied().collect();
+    let symmetry_deviation_x = symmetry_deviation_x(&mesh.positions, pf.scale);
+
+    if let Some(p) = progress.as_mut() {
+        let _ = p(1.0);
+    }
+    Ok(RemeshOutput {
+        stats: RemeshStats {
+            input_vertices,
+            input_faces,
+            welded_vertices_removed: merged as u64,
+            degenerate_faces_removed: degenerate_removed,
+            duplicate_faces_removed: duplicates_removed,
+            target_reached: true,
+            output_vertices: mesh.positions.len() as u64,
+            output_faces: mesh.faces.len() as u64,
+            quads: es.quads,
+            triangles: es.triangles,
+            ngons,
+            dropped_cycles: es.dropped_cycles,
+            euler_input,
+            euler_output: es.euler_output,
+            poles_valence3: valence.iter().filter(|&&k| k == 3).count() as u64,
+            poles_valence5: valence.iter().filter(|&&k| k == 5).count() as u64,
+            poles_other: valence
+                .iter()
+                .filter(|&&k| k != 3 && k != 4 && k != 5)
+                .count() as u64,
+            symmetry_deviation_x,
+            edge_length: pf.scale,
+            subdivision_vertices_added,
+            duration_seconds: start.elapsed().as_secs_f64(),
+            ..RemeshStats::default()
+        },
+        positions,
+        face_sizes,
+        indices,
+    })
+}
+
+/// Mean nearest-neighbour distance between the mirrored (x → −x) vertex set
+/// and the original set, divided by `scale`. Uses a uniform hash grid with
+/// cell size `scale`, searching the 27 neighbouring cells (distances beyond
+/// one cell are clamped to 1.5 cells).
+fn symmetry_deviation_x(points: &[[f32; 3]], scale: f64) -> f64 {
+    if points.is_empty() || scale <= 0.0 {
+        return 0.0;
+    }
+    let cell = |p: [f64; 3]| -> (i64, i64, i64) {
+        (
+            (p[0] / scale).floor() as i64,
+            (p[1] / scale).floor() as i64,
+            (p[2] / scale).floor() as i64,
+        )
+    };
+    let pts: Vec<[f64; 3]> = points
+        .iter()
+        .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .collect();
+    let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, &p) in pts.iter().enumerate() {
+        grid.entry(cell(p)).or_default().push(i);
+    }
+    let mut total = 0.0;
+    for p in &pts {
+        let m = [-p[0], p[1], p[2]];
+        let c = cell(m);
+        let mut best = 1.5 * scale;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(list) = grid.get(&(c.0 + dx, c.1 + dy, c.2 + dz)) {
+                        for &j in list {
+                            let q = pts[j];
+                            let d = ((q[0] - m[0]).powi(2)
+                                + (q[1] - m[1]).powi(2)
+                                + (q[2] - m[2]).powi(2))
+                            .sqrt();
+                            best = best.min(d);
+                        }
+                    }
+                }
+            }
+        }
+        total += best;
+    }
+    total / pts.len() as f64 / scale
 }
