@@ -804,24 +804,29 @@ fn position_round_4(
     o + q * (q.dot(&d) * inv_scale).round() * scale + t * (t.dot(&d) * inv_scale).round() * scale
 }
 
+/// Frame data for one side of a position-field compatibility call.
+#[derive(Clone, Copy)]
+struct FrameProbe {
+    p: Vector3<f64>,
+    n: Vector3<f64>,
+    q: Vector3<f64>,
+    o: Vector3<f64>,
+}
+
 /// Compatibility pair for intrinsic position averaging: rotate the
-/// neighbour frame into plane `n0` and snap onto the lattice relative to
-/// the current anchor `o0`.
+/// neighbour frame into plane `f0.n` and snap onto the lattice relative to
+/// the current anchor `f0.o`.
 fn compat_position_intrinsic_4(
-    p0: Vector3<f64>,
-    n0: Vector3<f64>,
-    _q0: Vector3<f64>,
-    o0: Vector3<f64>,
-    p1: Vector3<f64>,
-    n1: Vector3<f64>,
-    q1_raw: Vector3<f64>,
-    o1_raw: Vector3<f64>,
+    f0: FrameProbe,
+    f1: FrameProbe,
     scale: f64,
     inv_scale: f64,
 ) -> (Vector3<f64>, Vector3<f64>) {
+    let (p0, n0, o0) = (f0.p, f0.n, f0.o);
+    let (p1, n1) = (f1.p, f1.n);
     let cos_theta = n1.dot(&n0);
-    let mut q1 = q1_raw;
-    let mut o1 = o1_raw;
+    let mut q1 = f1.q;
+    let mut o1 = f1.o;
 
     if cos_theta < 0.9999 {
         let axis = n1.cross(&n0);
@@ -1006,14 +1011,18 @@ fn solve_position_level(
                 let o_j = anchors[j as usize];
                 let p_j = Vector3::from(level.positions[j as usize]);
                 let (v0, v1) = compat_position_intrinsic_4(
-                    v_i,
-                    n_i,
-                    q_i,
-                    sum,
-                    p_j,
-                    level.normals[j as usize],
-                    q_j,
-                    o_j,
+                    FrameProbe {
+                        p: v_i,
+                        n: n_i,
+                        q: q_i,
+                        o: sum,
+                    },
+                    FrameProbe {
+                        p: p_j,
+                        n: level.normals[j as usize],
+                        q: q_j,
+                        o: o_j,
+                    },
                     scale,
                     inv_scale,
                 );
