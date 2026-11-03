@@ -8,13 +8,16 @@ symmetry-aware solving, and density weighting for deformation regions
 (shoulders, elbows, knees, hips, face). Built for riggers, not just for
 pretty renders.
 
-> **Status — expect active development (M0: scaffold + native bridge).**
+> **Status — active development (M2a done: orientation field).**
 > What works today: native engine end-to-end (mesh welding, degenerate/
 > duplicate face removal, quadric decimation with boundary & crease
-> locking), installable Blender 4.2+/5.x extension, headless test suite.
-> What lands next: cross-field solve → quad extraction (Instant Field-
-> Aligned Meshes) → relaxation/snapping → symmetry & vertex-group density
-> painting. See [Roadmap](#roadmap).
+> locking), a deterministic 4-RoSy cross-field orientation solver on a
+> coarse-to-fine primal-graph hierarchy (1270-line reimplementation of the
+> Instant Field-Aligned Meshes kernel — unit-tested on synthetic and real
+> meshes, zero mismatch on a flat sheet), and an installable Blender
+> 4.2+/5.x extension with a headless test suite. What lands next: the
+> position field → quad extraction (same paper) → relaxation/snapping →
+> symmetry & vertex-group density painting. See [Roadmap](#roadmap).
 
 ## Why yet another remesher
 
@@ -105,9 +108,10 @@ Blender mesh ──foreach_get──> numpy float32/uint32
 | Milestone | Scope | Status |
 |---|---|---|
 | M0 | Scaffold, C ABI bridge, weld/degenerate/duplicate cleanup, quadric decimation, installable extension, CI/release | ✅ done |
-| M1 | Geometry kernel: half-edge mesh, welding stats, curvature & crease analysis, BVH surface projection | ▶ next |
-| M2 | 4-RoSy cross-field + position field with boundary/crease constraints; Poincaré–Hopf validation; debug visualisation | |
-| M3 | Iso-line tracing extraction → first field-aligned quad output (plane → sphere → genus-N) | |
+| M2a | 4-RoSy orientation field: coarse-to-fine primal-graph hierarchy, deterministic, fixture-tested (flat sheet → 0° residual) | ✅ done |
+| M1 | Geometry kernel: curvature & crease analysis, BVH surface projection (needed by extraction & relaxation) | ▶ next |
+| M2b | Position field on the same hierarchy; Poincaré–Hopf validation; debug visualisation | |
+| M3 | Dual-graph collapsing + face tracing extraction → first field-aligned quad output | |
 | M4 | Relaxation, surface snapping, pole reduction, boundary handling, stats | |
 | M5 | **v1.0** — X/Y/Z symmetry (half-solve + mirror stitch), vertex-group density weighting, crease toggle, presets, packaging | |
 

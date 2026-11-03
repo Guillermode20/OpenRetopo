@@ -7,8 +7,13 @@ use thiserror::Error;
 use crate::simplify::{simplify_to_target, SimplificationReport};
 use crate::weld::{weld_vertices, WeldReport};
 
+mod hierarchy;
 mod simplify;
 mod weld;
+
+pub mod field;
+#[doc(hidden)]
+pub mod obj;
 
 #[derive(Debug, Error)]
 pub enum RetopoError {
