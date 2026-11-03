@@ -862,7 +862,9 @@ fn extract_faces(
             for j in 0..adj[i].len() {
                 if let Some(cycle) = walk(&mut adj, i as u32, j, deg) {
                     stats.faces_traced += 1;
-                    fill_polygon(cycle, o, nrm, &mut edges, &mut faces);
+                    if !fill_polygon(cycle, o, nrm, &mut edges, &mut faces) {
+                        stats.dropped_cycles += 1;
+                    }
                 }
             }
         }
@@ -894,7 +896,9 @@ fn extract_faces(
             match walk(&mut adj, i as u32, j, 0) {
                 Some(cycle) => {
                     stats.holes_filled += 1;
-                    fill_polygon(cycle, o, nrm, &mut edges, &mut faces);
+                    if !fill_polygon(cycle, o, nrm, &mut edges, &mut faces) {
+                        stats.dropped_cycles += 1;
+                    }
                 }
                 None => stats.dropped_cycles += 1,
             }
@@ -903,95 +907,124 @@ fn extract_faces(
     faces
 }
 
-/// Emit a traced cycle as faces. Non-simple cycles (a vertex repeats) are
-/// split at the repeat into simple loops first. Simple cycles: 3 and 4 are
-/// emitted directly; larger ones lose the best-shaped quad (corner angles
-/// closest to 90°, chord must not already exist) until 3 or 4 remain. When
-/// no valid chord exists, a centroid vertex is inserted and the polygon is
-/// fanned into triangles (chord-free, always valid).
+/// Emit a traced cycle as faces; returns `false` if it could not be
+/// decomposed without breaking manifoldness (caller counts it as dropped).
+///
+/// Only chord cuts are used, so every corner (wedge) of the cycle stays
+/// with exactly one output face — this matters for non-simple cycles that
+/// visit a vertex twice, where re-pairing corners would pinch the vertex:
+///   1. spurs `x v a v y` (an edge walked out and back) are removed;
+///   2. a 3- or 4-cycle with distinct vertices is emitted;
+///   3. otherwise the best quad ear `c[i..=i+3]` is peeled (distinct
+///      vertices, chord `c[i]–c[i+3]` not yet an edge; corner angles
+///      closest to 90°), else the best triangle ear;
+///   4. a simple cycle with no valid ear is fanned around a new centroid.
 fn fill_polygon(
     cycle: Vec<u32>,
     o: &mut Vec<Vector3<f64>>,
     nrm: &mut Vec<Vector3<f64>>,
     edges: &mut HashSet<(u32, u32)>,
     faces: &mut Vec<Vec<u32>>,
-) {
-    // split at repeated vertices
-    if let Some((a, b)) = first_repeat(&cycle) {
-        let inner: Vec<u32> = cycle[a..b].to_vec();
-        let mut outer: Vec<u32> = cycle[..a].to_vec();
-        outer.extend_from_slice(&cycle[b..]);
-        for part in [inner, outer] {
-            if part.len() >= 3 {
-                fill_polygon(part, o, nrm, edges, faces);
-            }
-        }
-        return;
-    }
+) -> bool {
     let key = |a: u32, b: u32| (a.min(b), a.max(b));
     let mut cycle = cycle;
     loop {
+        remove_spurs(&mut cycle);
         let n = cycle.len();
-        if n == 3 || n == 4 {
-            faces.push(cycle);
-            return;
-        }
         if n < 3 {
-            return;
+            return n == 0;
+        }
+        let simple = first_repeat(&cycle).is_none();
+        if simple && (n == 3 || n == 4) {
+            faces.push(cycle);
+            return true;
         }
         let angle_at = |a: u32, b: u32, c: u32| -> f64 {
             let d0 = (o[a as usize] - o[b as usize]).normalize();
             let d1 = (o[c as usize] - o[b as usize]).normalize();
             d0.dot(&d1).clamp(-1.0, 1.0).acos().to_degrees()
         };
-        // n == 5 gives a quad + triangle; n >= 6 peels quads
-        let mut best: Option<(f64, usize)> = None;
-        for i in 0..n {
-            let chord = key(cycle[i], cycle[(i + 3) % n]);
-            if edges.contains(&chord) {
+        let mut best: Option<(f64, usize, usize)> = None; // (score, start, size)
+        for size in [4usize, 3] {
+            if size >= n {
                 continue;
             }
-            let mut score = 0.0;
-            for k in 0..4 {
-                score += (angle_at(
-                    cycle[(i + k) % n],
-                    cycle[(i + k + 1) % n],
-                    cycle[(i + k + 2) % n],
-                ) - 90.0)
-                    .abs();
+            for i in 0..n {
+                let ear: Vec<u32> = (0..size).map(|k| cycle[(i + k) % n]).collect();
+                if first_repeat(&ear).is_some() || edges.contains(&key(ear[0], ear[size - 1])) {
+                    continue;
+                }
+                let mut score = 0.0;
+                let target = if size == 4 { 90.0 } else { 60.0 };
+                for k in 0..size {
+                    let (a, b, c) = (ear[k], ear[(k + 1) % size], ear[(k + 2) % size]);
+                    score += (angle_at(a, b, c) - target).abs();
+                }
+                if score.is_nan() {
+                    continue;
+                }
+                if best.is_none_or(|(s, _, _)| score < s) {
+                    best = Some((score, i, size));
+                }
             }
-            if score.is_nan() {
-                continue;
-            }
-            if best.is_none_or(|(s, _)| score < s) {
-                best = Some((score, i));
+            if best.is_some() {
+                break; // prefer any valid quad ear over triangle ears
             }
         }
-        let Some((_, b)) = best else {
-            // fan around a new centroid vertex
-            let c = o.len() as u32;
-            let centroid = cycle.iter().map(|&v| o[v as usize]).sum::<Vector3<f64>>() / n as f64;
-            let cn = cycle.iter().map(|&v| nrm[v as usize]).sum::<Vector3<f64>>();
-            o.push(centroid);
-            nrm.push(if cn.norm() > 1e-30 {
-                cn.normalize()
-            } else {
-                Vector3::new(0.0, 0.0, 1.0)
-            });
-            for k in 0..n {
-                let (a, bb) = (cycle[k], cycle[(k + 1) % n]);
-                edges.insert(key(a, c));
-                faces.push(vec![a, bb, c]);
+        match best {
+            Some((_, i, size)) => {
+                let ear: Vec<u32> = (0..size).map(|k| cycle[(i + k) % n]).collect();
+                edges.insert(key(ear[0], ear[size - 1]));
+                faces.push(ear);
+                // drop the ear's interior vertices from the cycle
+                let mut rm: Vec<usize> = (1..size - 1).map(|k| (i + k) % n).collect();
+                rm.sort_unstable();
+                for &r in rm.iter().rev() {
+                    cycle.remove(r);
+                }
+            }
+            None if simple => {
+                let c = o.len() as u32;
+                let centroid =
+                    cycle.iter().map(|&v| o[v as usize]).sum::<Vector3<f64>>() / n as f64;
+                let cn = cycle.iter().map(|&v| nrm[v as usize]).sum::<Vector3<f64>>();
+                o.push(centroid);
+                nrm.push(if cn.norm() > 1e-30 {
+                    cn.normalize()
+                } else {
+                    Vector3::new(0.0, 0.0, 1.0)
+                });
+                for k in 0..n {
+                    let (a, b) = (cycle[k], cycle[(k + 1) % n]);
+                    edges.insert(key(a, c));
+                    faces.push(vec![a, b, c]);
+                }
+                return true;
+            }
+            None => return false,
+        }
+    }
+}
+
+/// Remove out-and-back spurs: `… x v a v y …` → `… x v y …`.
+fn remove_spurs(cycle: &mut Vec<u32>) {
+    loop {
+        let n = cycle.len();
+        if n < 3 {
+            // a 2-cycle (v a) is itself a spur
+            if n == 2 {
+                cycle.clear();
             }
             return;
+        }
+        let Some(i) = (0..n).find(|&i| cycle[(i + n - 1) % n] == cycle[(i + 1) % n]) else {
+            return;
         };
-        let quad: Vec<u32> = (0..4).map(|k| cycle[(b + k) % n]).collect();
-        edges.insert(key(quad[0], quad[3]));
-        faces.push(quad);
-        let mut rm = [(b + 1) % n, (b + 2) % n];
-        rm.sort_unstable();
-        cycle.remove(rm[1]);
-        cycle.remove(rm[0]);
+        // cycle[i] is the spur tip; remove it and the repeated base after it
+        let (a, b) = (i, (i + 1) % n);
+        let (hi, lo) = (a.max(b), a.min(b));
+        cycle.remove(hi);
+        cycle.remove(lo);
     }
 }
 
@@ -1117,6 +1150,52 @@ mod tests {
             "{name}: quad-dominant output expected, got {:.0}% quads",
             quads * 100.0
         );
+    }
+
+    #[test]
+    fn fill_polygon_keeps_corners_and_never_repeats_vertices() {
+        let mut o: Vec<Vector3<f64>> = (0..8)
+            .map(|k| {
+                let a = k as f64 * std::f64::consts::TAU / 8.0;
+                Vector3::new(a.cos(), a.sin(), 0.0)
+            })
+            .collect();
+        let mut nrm = vec![Vector3::new(0.0, 0.0, 1.0); o.len()];
+        // spur 1 -> 2 -> 1 collapses to the quad 0 1 3 4
+        let (mut edges, mut faces) = (HashSet::new(), Vec::new());
+        assert!(fill_polygon(
+            vec![0, 1, 2, 1, 3, 4],
+            &mut o,
+            &mut nrm,
+            &mut edges,
+            &mut faces
+        ));
+        assert_eq!(faces, vec![vec![0, 1, 3, 4]]);
+        // figure-eight through vertex 0: every face simple, every corner used once
+        let (mut edges, mut faces) = (HashSet::new(), Vec::new());
+        let cycle = vec![0, 1, 2, 3, 0, 5, 6, 7];
+        assert!(fill_polygon(
+            cycle.clone(),
+            &mut o,
+            &mut nrm,
+            &mut edges,
+            &mut faces
+        ));
+        for f in &faces {
+            assert!(first_repeat(f).is_none(), "face {f:?} repeats a vertex");
+        }
+        for k in 0..cycle.len() {
+            let n = cycle.len();
+            let wedge = (cycle[(k + n - 1) % n], cycle[k], cycle[(k + 1) % n]);
+            let at = |w: (u32, u32, u32)| {
+                faces
+                    .iter()
+                    .any(|f| f.contains(&w.0) && f.contains(&w.1) && f.contains(&w.2))
+            };
+            if wedge.1 == 0 {
+                assert!(at(wedge), "corner {wedge:?} lost");
+            }
+        }
     }
 
     #[test]
