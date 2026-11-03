@@ -27,6 +27,7 @@
 
 use nalgebra::Vector3;
 
+use crate::guidance::{self, LevelGuide, MirrorPlane};
 use crate::hierarchy::{self, Hierarchy, HierarchyLevel};
 
 /// Per-vertex cross-field result.
@@ -80,6 +81,13 @@ pub struct FieldOptions {
     /// Solve the position field coarse-to-fine on the same hierarchy as the
     /// orientation field (reference behaviour).
     pub hierarchical_positions: bool,
+    /// Pull toward principal curvature directions on anisotropic regions
+    /// (0 = pure smoothness). Needs `guidance_scale`.
+    pub curvature_weight: f64,
+    /// Target edge length the curvature anisotropy is measured against.
+    pub guidance_scale: f64,
+    /// Couple both fields to their mirror image across this plane.
+    pub mirror: Option<MirrorPlane>,
 }
 
 impl Default for FieldOptions {
@@ -93,6 +101,9 @@ impl Default for FieldOptions {
             convergence_degrees: 0.1,
             rosy: 4,
             hierarchical_positions: true,
+            curvature_weight: 0.0,
+            guidance_scale: 0.0,
+            mirror: None,
         }
     }
 }
@@ -240,6 +251,7 @@ fn color_graph(adj: &[Vec<(u32, f64)>]) -> Vec<Vec<usize>> {
 /// iteration cap. Returns the number of iterations performed.
 fn solve_level(
     level: &HierarchyLevel,
+    guide: &LevelGuide,
     dirs: &mut [Vector3<f64>],
     max_iterations: u32,
     convergence_degrees: f64,
@@ -268,6 +280,31 @@ fn solve_level(
                     if norm > 1e-12 {
                         sum /= norm;
                     }
+                }
+                let neighbour_weight = weight_sum;
+                let mut extra =
+                    |sum: &mut Vector3<f64>, q: Vector3<f64>, nq: Vector3<f64>, w: f64| {
+                        if w <= 0.0 {
+                            return;
+                        }
+                        let (v0, v1) = compat_orientation_intrinsic_4(*sum, n_i, q, nq);
+                        *sum = v0 * weight_sum + v1 * w;
+                        *sum -= n_i * n_i.dot(sum);
+                        weight_sum += w;
+                        let norm = sum.norm();
+                        if norm > 1e-12 {
+                            *sum /= norm;
+                        }
+                    };
+                if let (Some(plane), Some(&p)) = (guide.plane, guide.partner.get(i)) {
+                    if p != hierarchy::INVALID {
+                        let q = plane.vector(dirs[p as usize]);
+                        let nq = plane.vector(level.normals[p as usize]);
+                        extra(&mut sum, q, nq, neighbour_weight);
+                    }
+                }
+                if let Some(&(t, tw)) = guide.target.get(i) {
+                    extra(&mut sum, t, n_i, tw * neighbour_weight);
                 }
                 if weight_sum > 0.0 {
                     let change = fold_quarter_turns(dirs[i].angle(&sum).to_degrees());
@@ -307,6 +344,17 @@ pub fn solve_orientation(
     tris: &[[u32; 3]],
     options: &FieldOptions,
 ) -> Result<(OrientationField, FieldStats), crate::RetopoError> {
+    solve_orientation_guided(positions, tris, options, None)
+}
+
+/// [`solve_orientation`] with optional precomputed per-vertex curvature
+/// tensors (see [`guidance::tensors_through_refinement`]).
+pub fn solve_orientation_guided(
+    positions: &[[f64; 3]],
+    tris: &[[u32; 3]],
+    options: &FieldOptions,
+    curvature: Option<&[nalgebra::Matrix3<f64>]>,
+) -> Result<(OrientationField, FieldStats), crate::RetopoError> {
     let n = positions.len();
 
     let mut stats = FieldStats {
@@ -318,6 +366,13 @@ pub fn solve_orientation(
     let hierarchy = Hierarchy::build(positions, tris, 25);
     let n_levels = hierarchy.levels.len();
     stats.hierarchy_levels = n_levels;
+    let guides = guidance::build_guides(
+        &hierarchy,
+        options.curvature_weight,
+        options.guidance_scale,
+        options.mirror,
+        curvature,
+    );
 
     let mut dirs: Vec<Vec<Vector3<f64>>> = Vec::with_capacity(n_levels);
     dirs.resize(n_levels, Vec::new());
@@ -350,7 +405,13 @@ pub fn solve_orientation(
         } else {
             options.iterations_per_level
         };
-        let iters = solve_level(lv, &mut d, max_iter, options.convergence_degrees)?;
+        let iters = solve_level(
+            lv,
+            &guides[level],
+            &mut d,
+            max_iter,
+            options.convergence_degrees,
+        )?;
         if level == 0 {
             stats.iterations = iters;
         }
@@ -597,7 +658,7 @@ mod diagnostics {
                     }
                     init
                 };
-                let iters = solve_level(lv, &mut d, 300, 0.01).unwrap();
+                let iters = solve_level(lv, &LevelGuide::default(), &mut d, 300, 0.01).unwrap();
                 let mismatch = level_mismatch(lv, &d);
                 println!(
                     "  level {level:2}: nodes={:5} iters={iters:3} mean_mismatch={mismatch:.3} deg",
@@ -960,6 +1021,7 @@ pub fn solve_position(
         .collect();
     solve_position_level(
         &level,
+        &LevelGuide::default(),
         &orientation.directions,
         &mut o,
         scale,
@@ -1015,6 +1077,7 @@ fn solve_position_hierarchical(
     let inv_scale = 1.0 / scale;
     let hier = Hierarchy::build(positions, tris, 25);
     let q = restrict_orientation(&hier, &orientation.directions);
+    let guides = guidance::build_guides(&hier, 0.0, 0.0, options.mirror, None);
     let n_levels = hier.levels.len();
     let mut o: Vec<Vector3<f64>> = Vec::new();
     for level in (0..n_levels).rev() {
@@ -1044,6 +1107,7 @@ fn solve_position_hierarchical(
         };
         solve_position_level(
             lv,
+            &guides[level],
             &q[level],
             &mut o,
             scale,
@@ -1056,8 +1120,10 @@ fn solve_position_hierarchical(
 }
 
 /// One level of the position solve.
+#[allow(clippy::too_many_arguments)]
 fn solve_position_level(
     level: &HierarchyLevel,
+    guide: &LevelGuide,
     q_dirs: &[Vector3<f64>],
     anchors: &mut [Vector3<f64>],
     scale: f64,
@@ -1107,6 +1173,30 @@ fn solve_position_level(
                         sum /= weight_sum;
                     }
                     sum -= n_i * n_i.dot(&(sum - v_i));
+                }
+                if let (Some(plane), Some(&p)) = (guide.plane, guide.partner.get(i)) {
+                    if p != hierarchy::INVALID && weight_sum > 0.0 {
+                        let pu = p as usize;
+                        let w = weight_sum;
+                        let (v0, v1) = compat_position_intrinsic_4(
+                            FrameProbe {
+                                p: v_i,
+                                n: n_i,
+                                q: q_i,
+                                o: sum,
+                            },
+                            FrameProbe {
+                                p: plane.point_v(Vector3::from(level.positions[pu])),
+                                n: plane.vector(level.normals[pu]),
+                                q: plane.vector(q_dirs[pu]),
+                                o: plane.point_v(anchors[pu]),
+                            },
+                            scale,
+                            inv_scale,
+                        );
+                        sum = (v0 * weight_sum + v1 * w) / (weight_sum + w);
+                        sum -= n_i * n_i.dot(&(sum - v_i));
+                    }
                 }
                 // Re-anchor: pick the lattice point (with origin `sum`) closest
                 // to the vertex itself. Without this the anchor drifts freely
@@ -1248,6 +1338,7 @@ mod position_convergence {
                 convergence_degrees: 0.0,
                 rosy: 4,
                 hierarchical_positions: true,
+                ..FieldOptions::default()
             },
         )
         .unwrap();
@@ -1408,6 +1499,7 @@ mod sweep_iters {
             convergence_degrees: 0.0,
             rosy: 4,
             hierarchical_positions: hier,
+            ..FieldOptions::default()
         };
         let (orient, _) = solve_orientation(&positions, &tris, &FieldOptions::default()).unwrap();
         let pf = solve_position(&positions, &tris, &orient, target, &opts).unwrap();

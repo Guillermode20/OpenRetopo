@@ -45,6 +45,19 @@ pub fn subdivide_long_edges(
     max_length: f64,
     max_vertices: usize,
 ) -> Option<usize> {
+    subdivide_long_edges_with_parents(positions, tris, max_length, max_vertices, &mut Vec::new())
+}
+
+/// As [`subdivide_long_edges`], also appending the split edge `(a, b)` of
+/// every new vertex to `parents` (new vertex `k` ↔ `parents[k - n0]`), so
+/// per-vertex data can be carried onto the refined mesh.
+pub fn subdivide_long_edges_with_parents(
+    positions: &mut Vec<[f64; 3]>,
+    tris: &mut Vec<[u32; 3]>,
+    max_length: f64,
+    max_vertices: usize,
+    parents: &mut Vec<[u32; 2]>,
+) -> Option<usize> {
     if max_length <= 0.0 || !max_length.is_finite() {
         return Some(0);
     }
@@ -92,6 +105,7 @@ pub fn subdivide_long_edges(
         let pa = positions[a as usize];
         let pb = positions[b as usize];
         let vn = positions.len() as u32;
+        parents.push([a, b]);
         positions.push([
             (pa[0] + pb[0]) * 0.5,
             (pa[1] + pb[1]) * 0.5,

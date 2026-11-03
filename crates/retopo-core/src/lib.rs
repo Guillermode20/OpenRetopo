@@ -8,6 +8,7 @@ use crate::simplify::{simplify_to_target, SimplificationReport};
 use crate::weld::{weld_vertices, WeldReport};
 
 pub mod extract;
+pub mod guidance;
 mod hierarchy;
 mod simplify;
 pub mod subdivide;
@@ -71,6 +72,24 @@ pub struct RemeshOptions {
     pub lock_crease_degrees: f64,
     /// Safety cap on the refined working mesh (field-aligned mode).
     pub max_working_vertices: usize,
+    /// Mirror symmetry of the field-aligned result.
+    pub symmetry: Symmetry,
+    /// Strength of principal-curvature alignment (0 = smoothest field only,
+    /// 1 = default). Makes edge loops wrap around limbs and tubes.
+    pub curvature_alignment: f64,
+}
+
+/// Mirror-symmetry request. Planes pass through the surface's
+/// area-weighted centroid and are perpendicular to a local axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Symmetry {
+    #[default]
+    None,
+    /// Use the axis the input is most symmetric about, if any.
+    Auto,
+    X,
+    Y,
+    Z,
 }
 
 impl Default for RemeshOptions {
@@ -81,6 +100,8 @@ impl Default for RemeshOptions {
             weld_epsilon: 0.0,
             lock_crease_degrees: 180.0,
             max_working_vertices: 4_000_000,
+            symmetry: Symmetry::None,
+            curvature_alignment: 1.0,
         }
     }
 }
@@ -117,7 +138,9 @@ pub struct RemeshStats {
     /// Mean distance from each mirrored (x → −x) output vertex to the
     /// nearest output vertex, in units of the target edge length. ~0 for a
     /// perfectly X-symmetric result; only meaningful for symmetric input.
-    pub symmetry_deviation_x: f64,
+    pub symmetry_deviation: f64,
+    /// Mirror plane used: 0 = none, 1 = X, 2 = Y, 3 = Z.
+    pub symmetry_axis: u32,
     /// Target edge length used by the field solve (0 in decimate mode).
     pub edge_length: f64,
     /// Vertices added by the pre-solve refinement.
@@ -367,13 +390,19 @@ fn field_aligned(
     }
 
     // ---- refine so the input can carry the lattice -----------------------
+    // symmetry and curvature are estimated on the cleaned input, before
+    // refinement adds flat-facet vertices
+    let base = hierarchy::level_from_mesh(&verts, &tris);
+    let mirror = mirror_plane(&base, options.symmetry);
     let before = verts.len();
     let avg = subdivide::average_edge_length(&verts, &tris);
-    subdivide::subdivide_long_edges(
+    let mut parents = Vec::new();
+    subdivide::subdivide_long_edges_with_parents(
         &mut verts,
         &mut tris,
         (scale * 0.5).min(avg * 2.0),
         options.max_working_vertices,
+        &mut parents,
     )
     .ok_or(RetopoError::TooDense {
         limit: options.max_working_vertices,
@@ -382,8 +411,16 @@ fn field_aligned(
     report(&mut progress, 0.30)?;
 
     // ---- fields ----------------------------------------------------------
-    let fopts = field::FieldOptions::default();
-    let (orient, _) = field::solve_orientation(&verts, &tris, &fopts)?;
+    let curvature = (options.curvature_alignment > 0.0)
+        .then(|| guidance::tensors_through_refinement(&base, &parents, scale));
+    drop(base);
+    let fopts = field::FieldOptions {
+        curvature_weight: options.curvature_alignment.max(0.0),
+        guidance_scale: scale,
+        mirror,
+        ..field::FieldOptions::default()
+    };
+    let (orient, _) = field::solve_orientation_guided(&verts, &tris, &fopts, curvature.as_deref())?;
     report(&mut progress, 0.55)?;
     // The orientation field is scale-independent; the position field and
     // extraction are not. At some lattice phases extraction tunnels through
@@ -430,7 +467,14 @@ fn field_aligned(
     }
     let ngons = mesh.faces.iter().filter(|f| f.len() > 4).count() as u64;
     let positions: Vec<f32> = mesh.positions.iter().flatten().copied().collect();
-    let symmetry_deviation_x = symmetry_deviation_x(&mesh.positions, pf.scale);
+    let symmetry_deviation = symmetry_deviation(
+        &mesh.positions,
+        pf.scale,
+        mirror.unwrap_or(guidance::MirrorPlane {
+            axis: 0,
+            offset: 0.0,
+        }),
+    );
 
     if let Some(p) = progress.as_mut() {
         let _ = p(1.0);
@@ -457,7 +501,8 @@ fn field_aligned(
                 .iter()
                 .filter(|&&k| k != 3 && k != 4 && k != 5)
                 .count() as u64,
-            symmetry_deviation_x,
+            symmetry_deviation,
+            symmetry_axis: mirror.map_or(0, |m| m.axis as u32 + 1),
             edge_length: pf.scale,
             subdivision_vertices_added,
             extraction_attempts: extraction_attempts as u64,
@@ -474,7 +519,30 @@ fn field_aligned(
 /// and the original set, divided by `scale`. Uses a uniform hash grid with
 /// cell size `scale`, searching the 27 neighbouring cells (distances beyond
 /// one cell are clamped to 1.5 cells).
-fn symmetry_deviation_x(points: &[[f32; 3]], scale: f64) -> f64 {
+/// Resolve the requested symmetry to a plane through the area centroid.
+fn mirror_plane(
+    base: &hierarchy::HierarchyLevel,
+    symmetry: Symmetry,
+) -> Option<guidance::MirrorPlane> {
+    let axis = match symmetry {
+        Symmetry::None => return None,
+        Symmetry::Auto => return guidance::detect_mirror(base),
+        Symmetry::X => 0,
+        Symmetry::Y => 1,
+        Symmetry::Z => 2,
+    };
+    let total: f64 = base.areas.iter().sum();
+    let offset = base
+        .positions
+        .iter()
+        .zip(&base.areas)
+        .map(|(p, a)| p[axis] * a)
+        .sum::<f64>()
+        / total.max(1e-300);
+    Some(guidance::MirrorPlane { axis, offset })
+}
+
+fn symmetry_deviation(points: &[[f32; 3]], scale: f64, plane: guidance::MirrorPlane) -> f64 {
     if points.is_empty() || scale <= 0.0 {
         return 0.0;
     }
@@ -496,7 +564,7 @@ fn symmetry_deviation_x(points: &[[f32; 3]], scale: f64) -> f64 {
     }
     let mut total = 0.0;
     for p in &pts {
-        let m = [-p[0], p[1], p[2]];
+        let m = plane.point(*p);
         let c = cell(m);
         let mut best = 1.5 * scale;
         for dx in -1..=1 {

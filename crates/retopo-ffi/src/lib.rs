@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use openretopo_core::{remesh, RemeshMode, RemeshOptions, RemeshStats, RetopoError};
+use openretopo_core::{remesh, RemeshMode, RemeshOptions, RemeshStats, RetopoError, Symmetry};
 
 /// Bump when the ABI layout changes. Python asserts this on load.
 ///
@@ -26,6 +26,9 @@ pub const ABI_VERSION: u32 = 2;
 /// `OpenRetopoParams::flags` bit: run the legacy weld + decimate pipeline
 /// instead of field-aligned remeshing.
 pub const FLAG_DECIMATE_ONLY: u32 = 1;
+/// `OpenRetopoParams::flags` bit: disable principal-curvature alignment
+/// (smoothest field only).
+pub const FLAG_NO_CURVATURE: u32 = 2;
 pub const ERR_BUF_LEN: usize = 512;
 
 #[repr(C)]
@@ -42,7 +45,8 @@ pub struct OpenRetopoParams {
     /// Edges whose adjacent face normals exceed this angle are locked
     /// against collapse. `180.0` disables crease locking.
     pub lock_crease_degrees: f32,
-    /// Reserved for symmetry (0 = none, 1 = X, 2 = Y, 3 = Z). Unused today.
+    /// Mirror symmetry (field-aligned): 0 = none, 1 = X, 2 = Y, 3 = Z
+    /// (local axes, plane through the surface centroid), 4 = auto-detect.
     pub symmetry_axis: u32,
     /// Feature flags, see `FLAG_*`.
     pub flags: u32,
@@ -91,11 +95,13 @@ pub struct OpenRetopoStats {
     pub poles_valence5: u64,
     pub poles_other: u64,
     pub subdivision_vertices_added: u64,
-    pub symmetry_deviation_x: f64,
+    pub symmetry_deviation: f64,
     pub edge_length: f64,
     pub duration_seconds: f64,
     pub extraction_attempts: u64,
-    pub reserved: [u64; 3],
+    /// Mirror plane used: 0 = none, 1 = X, 2 = Y, 3 = Z.
+    pub symmetry_axis: u64,
+    pub reserved: [u64; 2],
 }
 
 impl OpenRetopoStats {
@@ -123,11 +129,12 @@ impl OpenRetopoStats {
             poles_valence5: s.poles_valence5,
             poles_other: s.poles_other,
             subdivision_vertices_added: s.subdivision_vertices_added,
-            symmetry_deviation_x: s.symmetry_deviation_x,
+            symmetry_deviation: s.symmetry_deviation,
             edge_length: s.edge_length,
             duration_seconds: s.duration_seconds,
             extraction_attempts: s.extraction_attempts,
-            reserved: [0; 3],
+            symmetry_axis: s.symmetry_axis as u64,
+            reserved: [0; 2],
         }
     }
 }
@@ -296,6 +303,26 @@ unsafe fn remesh_impl(
         target_faces: params_value.target_faces,
         weld_epsilon: params_value.weld_epsilon as f64,
         lock_crease_degrees: params_value.lock_crease_degrees as f64,
+        symmetry: match params_value.symmetry_axis {
+            0 => Symmetry::None,
+            1 => Symmetry::X,
+            2 => Symmetry::Y,
+            3 => Symmetry::Z,
+            4 => Symmetry::Auto,
+            other => {
+                write_err(
+                    err_buf,
+                    err_buf_len,
+                    &format!("invalid symmetry_axis {other} (expected 0-4)"),
+                );
+                return ERR_INVALID_ARG;
+            }
+        },
+        curvature_alignment: if params_value.flags & FLAG_NO_CURVATURE != 0 {
+            0.0
+        } else {
+            1.0
+        },
         ..RemeshOptions::default()
     };
 

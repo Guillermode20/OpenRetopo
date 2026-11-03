@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use openretopo_core::{obj, remesh, RemeshMode, RemeshOptions, RemeshOutput, RetopoError};
+use openretopo_core::{
+    obj, remesh, RemeshMode, RemeshOptions, RemeshOutput, RetopoError, Symmetry,
+};
 
 fn load(name: &str) -> (Vec<f32>, Vec<u32>) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -87,6 +89,42 @@ fn closed_fixtures_remesh_with_topology_preserved() {
             (0.6..1.6).contains(&ratio),
             "{name}: {} faces for target {target}",
             s.output_faces
+        );
+    }
+}
+
+#[test]
+fn symmetry_constraint_mirrors_the_result() {
+    // cylinder is mirror-symmetric; an off-centre copy checks the plane offset
+    let (mut p, i) = load("cylinder.obj");
+    for v in p.chunks_mut(3) {
+        v[0] += 3.0;
+    }
+    let run_sym = |symmetry| {
+        remesh(
+            &p,
+            &i,
+            &RemeshOptions {
+                target_faces: 300,
+                symmetry,
+                ..RemeshOptions::default()
+            },
+            None,
+        )
+        .unwrap()
+    };
+    let free = run_sym(Symmetry::None);
+    let auto = run_sym(Symmetry::Auto);
+    let x = run_sym(Symmetry::X);
+    assert_eq!(free.stats.symmetry_axis, 0);
+    assert_ne!(auto.stats.symmetry_axis, 0, "auto found no plane");
+    assert_eq!(x.stats.symmetry_axis, 1);
+    for out in [&auto, &x] {
+        assert_eq!(check_closed_manifold(out), 2);
+        assert!(
+            out.stats.symmetry_deviation < 0.1,
+            "mirror deviation {} cells",
+            out.stats.symmetry_deviation
         );
     }
 }
@@ -193,7 +231,7 @@ fn fixture_report() {
                     s.poles_valence3,
                     s.poles_valence5,
                     s.poles_other,
-                    s.symmetry_deviation_x,
+                    s.symmetry_deviation,
                     s.duration_seconds
                 );
             }

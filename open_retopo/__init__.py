@@ -39,6 +39,8 @@ _LIB_SPECS = {
 
 EXPECTED_ABI = 2
 FLAG_DECIMATE_ONLY = 1
+FLAG_NO_CURVATURE = 2
+SYMMETRY_CODES = {"NONE": 0, "X": 1, "Y": 2, "Z": 3, "AUTO": 4}
 
 
 class OpenRetopoParams(ctypes.Structure):
@@ -77,11 +79,12 @@ class OpenRetopoStats(ctypes.Structure):
         ("poles_valence5", ctypes.c_uint64),
         ("poles_other", ctypes.c_uint64),
         ("subdivision_vertices_added", ctypes.c_uint64),
-        ("symmetry_deviation_x", ctypes.c_double),
+        ("symmetry_deviation", ctypes.c_double),
         ("edge_length", ctypes.c_double),
         ("duration_seconds", ctypes.c_double),
         ("extraction_attempts", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 3),
+        ("symmetry_axis", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 2),
     ]
 
 _STAT_FIELDS = [name for name, _ in OpenRetopoStats._fields_ if not name.startswith("_") and name not in ("struct_size", "reserved")]
@@ -165,13 +168,27 @@ def _load_library():
 # mesh extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_triangles(mesh):
-    """Return (positions f32[n*3], indices u32[m*3]) from an evaluated mesh."""
+def _object_scale(obj):
+    """Per-axis world scale of the object (absolute values, never zero)."""
+    sc = obj.matrix_world.to_scale()
+    return np.array([max(abs(sc.x), 1e-12), max(abs(sc.y), 1e-12), max(abs(sc.z), 1e-12)], dtype=np.float64)
+
+
+def _extract_triangles(mesh, scale=None):
+    """Return (positions f32[n*3], indices u32[m*3]) from an evaluated mesh.
+
+    `scale` (per-axis) is applied so the engine sees the object's true
+    proportions: a non-uniformly scaled object would otherwise get quads
+    that look stretched in the viewport. Axes stay local, so symmetry
+    planes still match the object's own X/Y/Z.
+    """
     mesh.calc_loop_triangles()
 
     vcount = len(mesh.vertices)
     positions = np.empty(vcount * 3, dtype=np.float32)
     mesh.vertices.foreach_get("co", positions)
+    if scale is not None:
+        positions = (positions.reshape(-1, 3) * scale).astype(np.float32).reshape(-1)
 
     tcount = len(mesh.loop_triangles)
     indices = np.empty(tcount * 3, dtype=np.int32)
@@ -180,7 +197,8 @@ def _extract_triangles(mesh):
     return positions, indices
 
 
-def _native_remesh(positions, indices, target_faces, progress=None, decimate_only=False):
+def _native_remesh(positions, indices, target_faces, progress=None, decimate_only=False,
+                   symmetry="NONE", curvature=True):
     """Call the engine.
 
     Returns (positions f32[:,3], face_sizes u32[F], indices u32[sum(sizes)], stats dict).
@@ -193,8 +211,8 @@ def _native_remesh(positions, indices, target_faces, progress=None, decimate_onl
     params.target_faces = int(target_faces)
     params.weld_epsilon = 0.0  # auto
     params.lock_crease_degrees = 180.0  # disabled for now (M1+ will expose)
-    params.symmetry_axis = 0
-    params.flags = FLAG_DECIMATE_ONLY if decimate_only else 0
+    params.symmetry_axis = SYMMETRY_CODES[symmetry]
+    params.flags = (FLAG_DECIMATE_ONLY if decimate_only else 0) | (0 if curvature else FLAG_NO_CURVATURE)
     params.reserved = (ctypes.c_uint64 * 2)(0, 0)
 
     out_pos = pf()
@@ -259,9 +277,12 @@ def _native_remesh(positions, indices, target_faces, progress=None, decimate_onl
 # output object creation (main thread only)
 # ---------------------------------------------------------------------------
 
-def _create_output_object(context, source, positions, face_sizes, indices, suffix="_retopo"):
+def _create_output_object(context, source, positions, face_sizes, indices, suffix="_retopo", scale=None):
     """Build the result object. Raises NativeRetopologyError (and leaves no
-    trace in bpy.data) if Blender's validator would have to repair it."""
+    trace in bpy.data) if Blender's validator would have to repair it.
+    `scale` undoes the per-axis scale applied by `_extract_triangles`."""
+    if scale is not None:
+        positions = positions / scale
     starts = np.concatenate(([0], np.cumsum(face_sizes)[:-1])).astype(np.int64)
     faces = [indices[s:s + n].tolist() for s, n in zip(starts.tolist(), face_sizes.tolist())]
     mesh = bpy.data.meshes.new(source.name + suffix)
@@ -317,6 +338,22 @@ class OPENRETOPO_OT_remesh(Operator):
         ),
         default="FIELD",
     )
+    symmetry: EnumProperty(
+        name="Symmetry",
+        items=(
+            ("AUTO", "Auto", "Mirror across the object's most symmetric local axis, if it has one"),
+            ("NONE", "Off", "No symmetry constraint"),
+            ("X", "X", "Mirror across the object's local X axis"),
+            ("Y", "Y", "Mirror across the object's local Y axis"),
+            ("Z", "Z", "Mirror across the object's local Z axis"),
+        ),
+        default="AUTO",
+    )
+    curvature: BoolProperty(
+        name="Follow Curvature",
+        default=True,
+        description="Align edge loops with limbs and other tube-like shapes",
+    )
     sync: BoolProperty(
         name="Run Synchronously",
         default=False,
@@ -332,7 +369,8 @@ class OPENRETOPO_OT_remesh(Operator):
     def invoke(self, context, event):
         obj = context.active_object
         try:
-            positions, indices = _extract_triangles(obj.data)
+            self._scale = _object_scale(obj)
+            positions, indices = _extract_triangles(obj.data, self._scale)
         except Exception as exc:  # extraction must never kill Blender
             self.report({"ERROR"}, f"OpenRetopo: could not read mesh: {exc}")
             return {"CANCELLED"}
@@ -362,7 +400,7 @@ class OPENRETOPO_OT_remesh(Operator):
                 self._indices,
                 self.target_faces,
                 progress=self._shared,
-                decimate_only=self.mode == "DECIMATE",
+                **self._engine_options(),
             )
             self._queue.put(("ok", result))
         except Exception as exc:
@@ -370,19 +408,24 @@ class OPENRETOPO_OT_remesh(Operator):
 
     def _finish_sync(self, context):
         try:
-            result = _native_remesh(
-                self._positions, self._indices, self.target_faces, decimate_only=self.mode == "DECIMATE"
-            )
+            result = _native_remesh(self._positions, self._indices, self.target_faces, **self._engine_options())
         except NativeRetopologyError as exc:
             self.report({"ERROR"}, f"OpenRetopo: {exc}")
             return {"CANCELLED"}
         return self._create(context, *result)
 
+    def _engine_options(self):
+        return {
+            "decimate_only": self.mode == "DECIMATE",
+            "symmetry": self.symmetry,
+            "curvature": self.curvature,
+        }
+
     def _create(self, context, pos, sizes, idx, stats):
         global OPENRETOPO_LAST_STATS
         OPENRETOPO_LAST_STATS = None
         try:
-            obj = _create_output_object(context, self._source, pos, sizes, idx)
+            obj = _create_output_object(context, self._source, pos, sizes, idx, scale=self._scale)
         except NativeRetopologyError as exc:
             self.report({"ERROR"}, f"OpenRetopo: {exc}")
             return {"CANCELLED"}
@@ -390,9 +433,11 @@ class OPENRETOPO_OT_remesh(Operator):
             msg = (
                 f"OpenRetopo: {stats['output_faces']} faces "
                 f"({stats['quads']} quads, {stats['triangles']} tris), "
-                f"poles v3/v5/other {stats['poles_valence3']}/{stats['poles_valence5']}/{stats['poles_other']} "
-                f"in {stats['duration_seconds']:.2f}s"
+                f"poles v3/v5/other {stats['poles_valence3']}/{stats['poles_valence5']}/{stats['poles_other']}"
             )
+            if stats["symmetry_axis"]:
+                msg += f", mirrored on {'XYZ'[stats['symmetry_axis'] - 1]}"
+            msg += f" in {stats['duration_seconds']:.2f}s"
         else:
             msg = (
                 f"OpenRetopo: {stats['output_faces']} faces "
@@ -436,12 +481,11 @@ class OPENRETOPO_OT_remesh(Operator):
         # Fallback entry point (e.g. from Python scripts); behaves like sync.
         try:
             obj = context.active_object
-            positions, indices = _extract_triangles(obj.data)
+            self._scale = _object_scale(obj)
+            positions, indices = _extract_triangles(obj.data, self._scale)
             self._source = obj
             self._source_name = obj.name
-            result = _native_remesh(
-                positions, indices, self.target_faces, decimate_only=self.mode == "DECIMATE"
-            )
+            result = _native_remesh(positions, indices, self.target_faces, **self._engine_options())
         except NativeRetopologyError as exc:
             self.report({"ERROR"}, f"OpenRetopo: {exc}")
             return {"CANCELLED"}
@@ -472,8 +516,12 @@ class OPENRETOPO_PT_main(Panel):
         op = col.operator("open_retopo.remesh", text="Retopologize", icon="MOD_REMESH")
         scene_props = context.scene.open_retopo
         op.target_faces = scene_props.target_faces
+        op.symmetry = scene_props.symmetry
+        op.curvature = scene_props.curvature
 
         col.prop(scene_props, "target_faces")
+        col.prop(scene_props, "symmetry")
+        col.prop(scene_props, "curvature")
         col.separator()
         col.label(text="Closed meshes only (no holes).", icon="INFO")
 
@@ -485,6 +533,22 @@ class OPENRETOPO_SceneProps(PropertyGroup):
         min=100,
         max=1_000_000,
         description="Approximate face count for the output mesh",
+    )
+    symmetry: EnumProperty(
+        name="Symmetry",
+        items=(
+            ("AUTO", "Auto", "Mirror across the object's most symmetric local axis, if it has one"),
+            ("NONE", "Off", "No symmetry constraint"),
+            ("X", "X", "Mirror across the object's local X axis"),
+            ("Y", "Y", "Mirror across the object's local Y axis"),
+            ("Z", "Z", "Mirror across the object's local Z axis"),
+        ),
+        default="AUTO",
+    )
+    curvature: BoolProperty(
+        name="Follow Curvature",
+        default=True,
+        description="Align edge loops with limbs and other tube-like shapes",
     )
 
 

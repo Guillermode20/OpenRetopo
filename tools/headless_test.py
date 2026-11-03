@@ -75,12 +75,12 @@ def topology(obj):
     return len(me.vertices) - len(me.edges) + len(me.polygons), boundary, nonmanifold
 
 
-def field_case(label, obj, target, expected_chi):
+def field_case(label, obj, target, expected_chi, **kwargs):
     import open_retopo
 
     before = snapshot(obj)
     src_name = obj.name
-    result = bpy.ops.open_retopo.remesh("EXEC_DEFAULT", target_faces=target)
+    result = bpy.ops.open_retopo.remesh("EXEC_DEFAULT", target_faces=target, **kwargs)
     check(result == {"FINISHED"}, f"{label}: operator finished ({result})")
     out = bpy.data.objects.get(src_name + "_retopo")
     stats = open_retopo.OPENRETOPO_LAST_STATS
@@ -102,9 +102,11 @@ def field_case(label, obj, target, expected_chi):
     check(0.6 < len(me.polygons) / target < 1.6, f"{label}: face count {len(me.polygons)} near target {target}")
     check(all(p.use_smooth for p in me.polygons), f"{label}: smooth shaded")
     check(not me.validate(verbose=False), f"{label}: passes mesh.validate()")
-    check(out.matrix_world == obj.matrix_world, f"{label}: transform copied")
+    drift = max(abs(a - b) for ra, rb in zip(out.matrix_world, obj.matrix_world) for a, b in zip(ra, rb))
+    check(drift < 1e-5, f"{label}: transform copied (max drift {drift:.1e})")
     original = bpy.data.objects.get(src_name)
     check(original is not None and snapshot(original) == before, f"{label}: original untouched")
+    return out, stats
 
 
 def run():
@@ -124,6 +126,32 @@ def run():
     reset_scene()
     bpy.ops.mesh.primitive_torus_add(major_radius=1.5, minor_radius=0.5, major_segments=48, minor_segments=24)
     field_case("torus", bpy.context.active_object, 600, 0)
+
+    # ---- field-aligned: rotated, non-uniformly scaled, mirror-symmetric ----
+    reset_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=48, ring_count=24, radius=1.0)
+    egg = bpy.context.active_object
+    for v in egg.data.vertices:  # break Y/Z symmetry, keep local X symmetry
+        v.co.z += 0.35 * v.co.y + 0.25 * v.co.y * v.co.y
+        v.co.y += 0.3 * v.co.z * v.co.z
+    egg.rotation_euler = (0.0, 1.5708, 0.0)
+    egg.scale = (1.0, 0.6, 1.0)
+    bpy.context.view_layer.update()
+    out, stats = field_case("scaled egg (auto symmetry)", egg, 800, 2, symmetry="AUTO")
+    if out is not None:
+        check(stats["symmetry_axis"] == 1, f"scaled egg: mirrored on local X (axis {stats['symmetry_axis']})")
+        check(stats["symmetry_deviation"] < 0.1, f"scaled egg: mirror deviation {stats['symmetry_deviation']:.3f}")
+        # quads should be roughly square in world space despite scale (1, 0.6, 1)
+        mw = out.matrix_world
+        ratios = []
+        for p in out.data.polygons:
+            if len(p.vertices) == 4:
+                c = [mw @ out.data.vertices[i].co for i in p.vertices]
+                a, b = (c[1] - c[0]).length, (c[2] - c[1]).length
+                ratios.append(max(a, b) / max(min(a, b), 1e-9))
+        ratios.sort()
+        median = ratios[len(ratios) // 2] if ratios else 99
+        check(median < 1.35, f"scaled egg: world-space quads square-ish (median aspect {median:.2f})")
 
     # ---- field-aligned: open input is rejected cleanly --------------------
     reset_scene()

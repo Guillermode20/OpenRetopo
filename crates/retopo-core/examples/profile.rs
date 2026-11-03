@@ -1,24 +1,25 @@
 //! Stage timing for the field-aligned pipeline.
 //!
-//! cargo run --release -p openretopo-core --example profile -- mesh.obj [target_faces]
+//! cargo run --release -p openretopo-core --example profile -- mesh.obj [target_faces] [out.obj]
 //!
 //! Stages are delimited by the progress milestones `remesh()` reports
 //! (weld 0.25, subdivide 0.30, orientation 0.55, position 0.80,
-//! extraction 0.97).
+//! extraction 0.97). Env: OPENRETOPO_SYM=none|auto|x|y|z, OPENRETOPO_CURV=<weight>.
 
 use std::time::Instant;
 
-use openretopo_core::{obj, remesh, RemeshOptions};
+use openretopo_core::{obj, remesh, RemeshOptions, Symmetry};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .expect("usage: profile <mesh.obj> [target_faces]");
+        .expect("usage: profile <mesh.obj> [target_faces] [out.obj]");
     let target: u32 = args
         .next()
         .map(|s| s.parse().expect("target_faces"))
         .unwrap_or(12000);
+    let out_path = args.next();
     let m = obj::load(std::path::Path::new(&path)).expect("load obj");
     let p: Vec<f32> = m.positions.iter().flatten().copied().collect();
     let i: Vec<u32> = m.triangles.iter().flatten().copied().collect();
@@ -34,6 +35,19 @@ fn main() {
         &i,
         &RemeshOptions {
             target_faces: target,
+            // env knobs for experiments: OPENRETOPO_SYM=none|auto|x|y|z,
+            // OPENRETOPO_CURV=<weight>
+            symmetry: match std::env::var("OPENRETOPO_SYM").as_deref() {
+                Ok("auto") => Symmetry::Auto,
+                Ok("x") => Symmetry::X,
+                Ok("y") => Symmetry::Y,
+                Ok("z") => Symmetry::Z,
+                _ => Symmetry::None,
+            },
+            curvature_alignment: std::env::var("OPENRETOPO_CURV")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
             ..RemeshOptions::default()
         },
         Some(&mut cb),
@@ -56,9 +70,25 @@ fn main() {
     }
     match result {
         Ok(o) => {
+            if let Some(out) = &out_path {
+                let mut text = String::new();
+                for v in o.positions.chunks(3) {
+                    text += &format!("v {} {} {}\n", v[0], v[1], v[2]);
+                }
+                let mut off = 0;
+                for &n in &o.face_sizes {
+                    text += "f";
+                    for k in 0..n as usize {
+                        text += &format!(" {}", o.indices[off + k] + 1);
+                    }
+                    text += "\n";
+                    off += n as usize;
+                }
+                std::fs::write(out, text).expect("write output obj");
+            }
             let s = &o.stats;
             println!(
-                "{path}: {} tris in → {} faces ({:.1}% quads), χ {}→{}, poles v3/v5/other {}/{}/{}, +{} subdiv verts, {} attempt(s), total {total:.3}s",
+                "{path}: {} tris in → {} faces ({:.1}% quads), χ {}→{}, poles v3/v5/other {}/{}/{}, +{} subdiv verts, {} attempt(s), sym axis {} dev {:.3}, total {total:.3}s",
                 i.len() / 3,
                 s.output_faces,
                 100.0 * s.quads as f64 / s.output_faces as f64,
@@ -68,7 +98,9 @@ fn main() {
                 s.poles_valence5,
                 s.poles_other,
                 s.subdivision_vertices_added,
-                s.extraction_attempts
+                s.extraction_attempts,
+                s.symmetry_axis,
+                s.symmetry_deviation
             );
         }
         Err(e) => println!("{path}: ERROR after {total:.3}s: {e}"),
