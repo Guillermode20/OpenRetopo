@@ -147,6 +147,78 @@ pub fn tangents(pos: &[[f64; 3]], edges: &HashSet<(u32, u32)>) -> Vec<Option<Vec
         .collect()
 }
 
+/// Corners of the crease network: junctions (three or more crease edges)
+/// and points where a line turns by more than `turn_deg` within
+/// `window` arc length on either side (e.g. the tip of a toe, where the sole
+/// rim swings round). Along a turn only the sharpest point within `window`
+/// is kept.
+pub fn corners(
+    pos: &[[f64; 3]],
+    edges: &HashSet<(u32, u32)>,
+    window: f64,
+    turn_deg: f64,
+) -> Vec<[f64; 3]> {
+    let mut nbrs: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut sorted: Vec<_> = edges.iter().copied().collect();
+    sorted.sort_unstable();
+    for (a, b) in sorted {
+        nbrs.entry(a).or_default().push(b);
+        nbrs.entry(b).or_default().push(a);
+    }
+    let p = |v: u32| Vector3::from(pos[v as usize]);
+    // walk from `from` through `next` along the chain until `window` arc
+    // length is covered (or the chain ends / branches); returns the end
+    let walk = |from: u32, next: u32| -> Vector3<f64> {
+        let (mut prev, mut cur) = (from, next);
+        let mut len = (p(cur) - p(prev)).norm();
+        while len < window {
+            let Some(list) = nbrs.get(&cur) else { break };
+            let [x, y] = list.as_slice() else { break };
+            let nxt = if *x == prev { *y } else { *x };
+            if nxt == from {
+                break; // closed loop shorter than the window
+            }
+            len += (p(nxt) - p(cur)).norm();
+            (prev, cur) = (cur, nxt);
+        }
+        p(cur)
+    };
+    let cos_turn = turn_deg.to_radians().cos();
+    let mut keys: Vec<u32> = nbrs.keys().copied().collect();
+    keys.sort_unstable();
+    let mut turn: HashMap<u32, f64> = HashMap::new(); // 1 - cos(turn)
+    let mut out: Vec<[f64; 3]> = Vec::new();
+    for &v in &keys {
+        match nbrs[&v].as_slice() {
+            [a, b] => {
+                let (u, w) = (p(v) - walk(v, *a), walk(v, *b) - p(v));
+                let c = u.dot(&w) / (u.norm() * w.norm()).max(1e-30);
+                if c < cos_turn {
+                    turn.insert(v, 1.0 - c);
+                }
+            }
+            // a line end is where a crease fades out, not a corner
+            [_] => {}
+            _ => {
+                turn.insert(v, 3.0); // junctions rank above every turn
+            }
+        }
+    }
+    // non-maximum suppression within `window`: sharpest first
+    let mut cand: Vec<(f64, u32)> = turn.into_iter().map(|(v, t)| (t, v)).collect();
+    cand.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+    let mut kept: Vec<Vector3<f64>> = Vec::new();
+    for (_, v) in cand {
+        let pv = p(v);
+        if kept.iter().all(|q| (q - pv).norm() > window) {
+            kept.push(pv);
+            out.push(pos[v as usize]);
+        }
+    }
+    out.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// Line segments of the crease edges, for projecting output vertices.
 pub fn segments(
     pos: &[[f64; 3]],

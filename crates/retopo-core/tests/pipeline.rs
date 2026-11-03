@@ -73,6 +73,12 @@ fn closed_fixtures_remesh_with_topology_preserved() {
         let out = run(name, target).unwrap_or_else(|e| panic!("{name}: {e}"));
         let s = &out.stats;
         assert_eq!(check_closed_manifold(&out), chi, "{name}");
+        // no doublets (valence-2 vertices fold the grid)
+        let mut valence = vec![0u32; out.positions.len() / 3];
+        for &v in &out.indices {
+            valence[v as usize] += 1;
+        }
+        assert!(valence.iter().all(|&k| k >= 3), "{name}: valence-2 vertex");
         assert_eq!(s.euler_input, chi, "{name}");
         assert_eq!(s.euler_output, chi, "{name}");
         assert_eq!(s.dropped_cycles, 0, "{name}");
@@ -157,6 +163,60 @@ fn symmetry_constraint_mirrors_the_result() {
         m.sort_unstable();
         assert!(faces.contains(&m), "face {f:?} has no mirror image");
     }
+}
+
+#[test]
+fn quads_only_has_no_triangles_and_keeps_symmetry() {
+    for (name, target, chi) in [
+        ("icosphere.obj", 320u32, 2i64),
+        ("torus.obj", 300, 0),
+        ("displaced_sphere.obj", 1500, 2),
+    ] {
+        let (p, i) = load(name);
+        let out = remesh(
+            &p,
+            &i,
+            &RemeshOptions {
+                target_faces: target,
+                quads_only: true,
+                ..RemeshOptions::default()
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(check_closed_manifold(&out), chi, "{name}");
+        assert!(
+            out.face_sizes.iter().all(|&n| n == 4),
+            "{name}: not all quads"
+        );
+        assert_eq!(out.stats.triangles, 0);
+        let ratio = out.stats.output_faces as f64 / target as f64;
+        assert!(
+            (0.5..1.7).contains(&ratio),
+            "{name}: {} faces for target {target}",
+            out.stats.output_faces
+        );
+    }
+    let (p, i) = load("cylinder.obj");
+    let out = remesh(
+        &p,
+        &i,
+        &RemeshOptions {
+            target_faces: 300,
+            quads_only: true,
+            symmetry: Symmetry::X,
+            ..RemeshOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(check_closed_manifold(&out), 2);
+    assert!(out.face_sizes.iter().all(|&n| n == 4));
+    assert!(
+        out.stats.symmetry_deviation < 0.01,
+        "mirror deviation {}",
+        out.stats.symmetry_deviation
+    );
 }
 
 #[test]

@@ -88,6 +88,10 @@ pub struct RemeshOptions {
     /// creases: edge loops follow them exactly (thin rims, hard edges).
     /// `0` or `>= 180` disables.
     pub crease_degrees: f64,
+    /// All-quad output: extract at twice the edge length, then split every
+    /// face into quads once (triangles become three quads around a
+    /// valence-3 pole).
+    pub quads_only: bool,
 }
 
 /// Mirror-symmetry request. Planes pass through the surface's
@@ -115,6 +119,7 @@ impl Default for RemeshOptions {
             curvature_alignment: 1.0,
             adaptivity: 0.6,
             crease_degrees: 40.0,
+            quads_only: false,
         }
     }
 }
@@ -413,6 +418,7 @@ fn field_aligned(
     } else {
         Default::default()
     };
+    let crease_corners = crease::corners(&verts, &crease_edges, scale, 40.0);
     let avg = subdivide::average_edge_length(&verts, &tris);
     let adaptivity = if options.adaptivity.is_finite() {
         options.adaptivity.clamp(0.0, 1.0)
@@ -479,7 +485,8 @@ fn field_aligned(
     let mut fallback = None;
     let mut mirror_image: Option<Vec<u32>> = None;
     for (attempt, m) in SCALE_STEPS.iter().enumerate() {
-        let scaled: Vec<f64> = sizes.iter().map(|h| h * m).collect();
+        let coarse = if options.quads_only { 2.0 } else { 1.0 };
+        let scaled: Vec<f64> = sizes.iter().map(|h| h * m * coarse).collect();
         let pf = field::solve_position_adaptive(&verts, &tris, &orient, &scaled, &fopts, creases)?;
         report(&mut progress, 0.80)?; // also lets the host cancel between retries
         match extract::extract_mesh_adaptive(
@@ -492,6 +499,19 @@ fn field_aligned(
         ) {
             Ok(mut mesh) => {
                 cleanup::merge_triangles(&mesh.positions, &mut mesh.faces, None);
+                // walk lone triangles along quad strips into pairs; the
+                // mirror seam is left alone so it stays a clean loop
+                let near_seam = |v: u32| {
+                    mirror.is_some_and(|m| {
+                        (mesh.positions[v as usize][m.axis] as f64 - m.offset).abs()
+                            < 0.3 * pf.scale
+                    })
+                };
+                let positions = mesh.positions.clone();
+                cleanup::pair_triangles(&positions, &mut mesh.faces, &near_seam, 8, 55.0);
+                if cleanup::dissolve_doublets(&mut mesh.faces, mesh.positions.len()) > 0 {
+                    cleanup::compact(&mut mesh.positions, &mut mesh.faces);
+                }
                 mesh.stats.quads = mesh.faces.iter().filter(|f| f.len() == 4).count() as u64;
                 mesh.stats.triangles = mesh.faces.iter().filter(|f| f.len() == 3).count() as u64;
                 let Some(plane) = mirror else {
@@ -534,6 +554,11 @@ fn field_aligned(
     let Some((pf, mut mesh, extraction_attempts)) = solved.or(fallback) else {
         return Err(attempt_error.expect("at least one attempt ran"));
     };
+    if options.quads_only {
+        cleanup::subdivide_quads(&mut mesh.positions, &mut mesh.faces, mirror_image.as_mut());
+        mesh.stats.quads = mesh.faces.len() as u64;
+        mesh.stats.triangles = 0;
+    }
     // ---- polish: even out the spacing, staying on the input surface -----
     {
         let surface = cleanup::SurfaceIndex::new(&verts, &tris, 2.0 * pf.scale);
@@ -542,6 +567,7 @@ fn field_aligned(
             &mesh.faces,
             &surface,
             &cleanup::CreaseIndex::new(crease::segments(&verts, &crease_edges), 2.0 * pf.scale),
+            &crease_corners,
             mirror,
             RELAX_ITERATIONS,
         );
@@ -573,9 +599,15 @@ fn field_aligned(
     }
     let ngons = mesh.faces.iter().filter(|f| f.len() > 4).count() as u64;
     let positions: Vec<f32> = mesh.positions.iter().flatten().copied().collect();
+    // quads-only output is one subdivision finer than the lattice
+    let out_scale = if options.quads_only {
+        0.5 * pf.scale
+    } else {
+        pf.scale
+    };
     let symmetry_deviation = symmetry_deviation(
         &mesh.positions,
-        pf.scale,
+        out_scale,
         mirror.unwrap_or(guidance::MirrorPlane {
             axis: 0,
             offset: 0.0,
@@ -609,7 +641,7 @@ fn field_aligned(
                 .count() as u64,
             symmetry_deviation,
             symmetry_axis: mirror.map_or(0, |m| m.axis as u32 + 1),
-            edge_length: pf.scale,
+            edge_length: out_scale,
             subdivision_vertices_added,
             extraction_attempts: extraction_attempts as u64,
             duration_seconds: start.elapsed().as_secs_f64(),

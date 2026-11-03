@@ -27,7 +27,9 @@ use openretopo_core::{remesh, RemeshMode, RemeshOptions, RemeshStats, RetopoErro
 ///     is rejected instead of producing unsymmetric output.
 /// v4: `adaptivity` (curvature-adaptive density, 0-1) takes the first
 ///     reserved slot of `OpenRetopoParams` (same size).
-pub const ABI_VERSION: u32 = 4;
+/// v5: `FLAG_QUADS_ONLY` (same layout). Bumped so a stale v4 library,
+///     which would ignore the flag, is rejected.
+pub const ABI_VERSION: u32 = 5;
 
 /// `OpenRetopoParams::flags` bit: run the legacy weld + decimate pipeline
 /// instead of field-aligned remeshing.
@@ -38,6 +40,9 @@ pub const FLAG_NO_CURVATURE: u32 = 2;
 /// `OpenRetopoParams::flags` bit: do not detect sharp creases (thin rims,
 /// hard edges) to align edge loops with.
 pub const FLAG_NO_CREASES: u32 = 4;
+/// `OpenRetopoParams::flags` bit: all-quad output (coarser lattice split
+/// once into quads; no triangles).
+pub const FLAG_QUADS_ONLY: u32 = 8;
 pub const ERR_BUF_LEN: usize = 512;
 
 #[repr(C)]
@@ -343,6 +348,7 @@ unsafe fn remesh_impl(
         } else {
             RemeshOptions::default().crease_degrees
         },
+        quads_only: params_value.flags & FLAG_QUADS_ONLY != 0,
         adaptivity: if params_value.adaptivity.is_finite() {
             params_value.adaptivity.clamp(0.0, 1.0) as f64
         } else {

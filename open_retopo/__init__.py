@@ -37,10 +37,11 @@ _LIB_SPECS = {
     ("darwin", "arm64"): ("macos_universal2", "libopenretopo.dylib"),
 }
 
-EXPECTED_ABI = 4
+EXPECTED_ABI = 5
 FLAG_DECIMATE_ONLY = 1
 FLAG_NO_CURVATURE = 2
 FLAG_NO_CREASES = 4
+FLAG_QUADS_ONLY = 8
 SYMMETRY_CODES = {"NONE": 0, "X": 1, "Y": 2, "Z": 3, "AUTO": 4}
 
 
@@ -230,7 +231,8 @@ def _extract_triangles(mesh, scale=None):
 
 
 def _native_remesh(positions, indices, target_faces, progress=None, decimate_only=False,
-                   symmetry="NONE", curvature=True, adaptivity=0.0, creases=True):
+                   symmetry="NONE", curvature=True, adaptivity=0.0, creases=True,
+                   quads_only=False):
     """Call the engine.
 
     Returns (positions f32[:,3], face_sizes u32[F], indices u32[sum(sizes)], stats dict).
@@ -248,6 +250,7 @@ def _native_remesh(positions, indices, target_faces, progress=None, decimate_onl
         (FLAG_DECIMATE_ONLY if decimate_only else 0)
         | (0 if curvature else FLAG_NO_CURVATURE)
         | (0 if creases else FLAG_NO_CREASES)
+        | (FLAG_QUADS_ONLY if quads_only else 0)
     )
     params.adaptivity = float(adaptivity)
     params.reserved = (ctypes.c_uint64 * 1)(0)
@@ -397,6 +400,12 @@ class OPENRETOPO_OT_remesh(Operator):
         description="Run edge loops exactly along sharp rims and hard edges (ear rims, fins, "
         "creases) instead of cutting across them",
     )
+    quads_only: BoolProperty(
+        name="Quads Only",
+        default=False,
+        description="No triangles: build a mesh with a quarter of the faces and split every "
+        "face into quads. Small details (fingers, ear tips) suffer at low face counts",
+    )
     adaptivity: FloatProperty(
         name="Adaptive Density",
         default=0.6,
@@ -473,6 +482,7 @@ class OPENRETOPO_OT_remesh(Operator):
             "curvature": self.curvature,
             "adaptivity": self.adaptivity,
             "creases": self.creases,
+            "quads_only": self.quads_only,
         }
 
     def _create(self, context, pos, sizes, idx, stats):
@@ -574,11 +584,13 @@ class OPENRETOPO_PT_main(Panel):
         op.curvature = scene_props.curvature
         op.adaptivity = scene_props.adaptivity
         op.creases = scene_props.creases
+        op.quads_only = scene_props.quads_only
 
         col.prop(scene_props, "target_faces")
         col.prop(scene_props, "symmetry")
         col.prop(scene_props, "curvature")
         col.prop(scene_props, "creases")
+        col.prop(scene_props, "quads_only")
         col.prop(scene_props, "adaptivity", slider=True)
         col.separator()
         col.label(text="Closed meshes only (no holes).", icon="INFO")
@@ -613,6 +625,12 @@ class OPENRETOPO_SceneProps(PropertyGroup):
         default=True,
         description="Run edge loops exactly along sharp rims and hard edges (ear rims, fins, "
         "creases) instead of cutting across them",
+    )
+    quads_only: BoolProperty(
+        name="Quads Only",
+        default=False,
+        description="No triangles: build a mesh with a quarter of the faces and split every "
+        "face into quads. Small details (fingers, ear tips) suffer at low face counts",
     )
     adaptivity: FloatProperty(
         name="Adaptive Density",
