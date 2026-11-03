@@ -344,7 +344,7 @@ pub fn solve_orientation(
     tris: &[[u32; 3]],
     options: &FieldOptions,
 ) -> Result<(OrientationField, FieldStats), crate::RetopoError> {
-    solve_orientation_guided(positions, tris, options, None)
+    solve_orientation_guided(positions, tris, options, None, None)
 }
 
 /// [`solve_orientation`] with optional precomputed per-vertex curvature
@@ -354,6 +354,7 @@ pub fn solve_orientation_guided(
     tris: &[[u32; 3]],
     options: &FieldOptions,
     curvature: Option<&[nalgebra::Matrix3<f64>]>,
+    creases: Option<&[Option<Vector3<f64>>]>,
 ) -> Result<(OrientationField, FieldStats), crate::RetopoError> {
     let n = positions.len();
 
@@ -372,6 +373,7 @@ pub fn solve_orientation_guided(
         options.guidance_scale,
         options.mirror,
         curvature,
+        creases,
     );
 
     let mut dirs: Vec<Vec<Vector3<f64>>> = Vec::with_capacity(n_levels);
@@ -1015,7 +1017,7 @@ pub fn solve_position(
 
     if options.hierarchical_positions {
         let scales = vec![scale; n];
-        let o = solve_position_hierarchical(positions, tris, orientation, &scales, options)?;
+        let o = solve_position_hierarchical(positions, tris, orientation, &scales, options, None)?;
         return Ok(PositionField {
             anchors: o,
             scale,
@@ -1054,12 +1056,13 @@ pub fn solve_position_adaptive(
     orientation: &OrientationField,
     scales: &[f64],
     options: &FieldOptions,
+    creases: Option<&[Option<Vector3<f64>>]>,
 ) -> Result<PositionField, crate::RetopoError> {
     assert_eq!(scales.len(), positions.len(), "one scale per vertex");
     let areas = hierarchy::dual_areas(positions, tris);
     let total: f64 = areas.iter().sum();
     let mean = areas.iter().zip(scales).map(|(a, s)| a * s).sum::<f64>() / total.max(1e-300);
-    let o = solve_position_hierarchical(positions, tris, orientation, scales, options)?;
+    let o = solve_position_hierarchical(positions, tris, orientation, scales, options, creases)?;
     Ok(PositionField {
         anchors: o,
         scale: mean,
@@ -1107,6 +1110,7 @@ fn solve_position_hierarchical(
     orientation: &OrientationField,
     fine_scales: &[f64],
     options: &FieldOptions,
+    creases: Option<&[Option<Vector3<f64>>]>,
 ) -> Result<Vec<Vector3<f64>>, crate::RetopoError> {
     let hier = Hierarchy::build(positions, tris, 25);
     let q = restrict_orientation(&hier, &orientation.directions);
@@ -1133,7 +1137,7 @@ fn solve_position_hierarchical(
             .collect();
         level_scales.push(next);
     }
-    let guides = guidance::build_guides(&hier, 0.0, 0.0, options.mirror, None);
+    let guides = guidance::build_guides(&hier, 0.0, 0.0, options.mirror, None, creases);
     let n_levels = hier.levels.len();
     let mut o: Vec<Vector3<f64>> = Vec::new();
     for level in (0..n_levels).rev() {
@@ -1258,6 +1262,22 @@ fn solve_position_level(
                         sum = (v0 * weight_sum + v1 * w) / (weight_sum + w);
                         sum -= n_i * n_i.dot(&(sum - v_i));
                     }
+                }
+                // Crease: slide the lattice origin along the direction that
+                // crosses the crease until a lattice line runs through the
+                // vertex, i.e. along the crease (no staircase across a rim).
+                // (the mirror seam has priority near the plane)
+                let near_seam = guide
+                    .plane
+                    .is_some_and(|pl| (v_i[pl.axis] - pl.offset).abs() < 2.0 * s_i);
+                if let (Some(Some(t)), false) = (guide.crease.get(i), near_seam) {
+                    let t_i = n_i.cross(&q_i);
+                    let c = if q_i.dot(t).abs() <= t_i.dot(t).abs() {
+                        q_i
+                    } else {
+                        t_i
+                    };
+                    sum += c * c.dot(&(v_i - sum));
                 }
                 // Mirror seam: near the plane, slide the lattice origin along
                 // the plane-crossing direction onto the plane, so one lattice

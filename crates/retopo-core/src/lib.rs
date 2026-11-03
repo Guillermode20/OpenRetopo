@@ -8,6 +8,7 @@ use crate::simplify::{simplify_to_target, SimplificationReport};
 use crate::weld::{weld_vertices, WeldReport};
 
 pub mod cleanup;
+pub mod crease;
 pub mod extract;
 pub mod guidance;
 mod hierarchy;
@@ -83,6 +84,10 @@ pub struct RemeshOptions {
     /// regions get larger faces, tight features (fingers, ears, joints)
     /// smaller ones, at the same total face budget.
     pub adaptivity: f64,
+    /// Input edges whose faces meet at more than this angle (degrees) are
+    /// creases: edge loops follow them exactly (thin rims, hard edges).
+    /// `0` or `>= 180` disables.
+    pub crease_degrees: f64,
 }
 
 /// Mirror-symmetry request. Planes pass through the surface's
@@ -109,6 +114,7 @@ impl Default for RemeshOptions {
             symmetry: Symmetry::None,
             curvature_alignment: 1.0,
             adaptivity: 0.6,
+            crease_degrees: 40.0,
         }
     }
 }
@@ -402,6 +408,11 @@ fn field_aligned(
     let base = hierarchy::level_from_mesh(&verts, &tris);
     let mirror = mirror_plane(&base, options.symmetry);
     let before = verts.len();
+    let mut crease_edges = if options.crease_degrees > 0.0 && options.crease_degrees < 180.0 {
+        crease::crease_edges(&verts, &tris, options.crease_degrees, 1.5 * scale)
+    } else {
+        Default::default()
+    };
     let avg = subdivide::average_edge_length(&verts, &tris);
     let adaptivity = if options.adaptivity.is_finite() {
         options.adaptivity.clamp(0.0, 1.0)
@@ -439,6 +450,9 @@ fn field_aligned(
             t.push(m);
         }
     }
+    crease::refine(&mut crease_edges, &parents, before);
+    let crease_tangents = crease::tangents(&verts, &crease_edges);
+    let creases = (!crease_edges.is_empty()).then_some(crease_tangents.as_slice());
     let subdivision_vertices_added = (verts.len() - before) as u64;
     report(&mut progress, 0.30)?;
 
@@ -451,7 +465,8 @@ fn field_aligned(
         mirror,
         ..field::FieldOptions::default()
     };
-    let (orient, _) = field::solve_orientation_guided(&verts, &tris, &fopts, curvature.as_deref())?;
+    let (orient, _) =
+        field::solve_orientation_guided(&verts, &tris, &fopts, curvature.as_deref(), creases)?;
     report(&mut progress, 0.55)?;
     // The orientation field is scale-independent; the position field and
     // extraction are not. At some lattice phases extraction tunnels through
@@ -465,7 +480,7 @@ fn field_aligned(
     let mut mirror_image: Option<Vec<u32>> = None;
     for (attempt, m) in SCALE_STEPS.iter().enumerate() {
         let scaled: Vec<f64> = sizes.iter().map(|h| h * m).collect();
-        let pf = field::solve_position_adaptive(&verts, &tris, &orient, &scaled, &fopts)?;
+        let pf = field::solve_position_adaptive(&verts, &tris, &orient, &scaled, &fopts, creases)?;
         report(&mut progress, 0.80)?; // also lets the host cancel between retries
         match extract::extract_mesh_adaptive(
             &verts,
@@ -526,6 +541,7 @@ fn field_aligned(
             &mut mesh.positions,
             &mesh.faces,
             &surface,
+            &cleanup::CreaseIndex::new(crease::segments(&verts, &crease_edges), 2.0 * pf.scale),
             mirror,
             RELAX_ITERATIONS,
         );

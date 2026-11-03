@@ -5,7 +5,7 @@
 //! Stages are delimited by the progress milestones `remesh()` reports
 //! (weld 0.25, subdivide 0.30, orientation 0.55, position 0.80,
 //! extraction 0.97). Env: OPENRETOPO_SYM=none|auto|x|y|z, OPENRETOPO_CURV=<weight>,
-//! OPENRETOPO_ADAPT=<0..1>.
+//! OPENRETOPO_ADAPT=<0..1>, OPENRETOPO_CREASE=<degrees, 0 = off>.
 
 use std::time::Instant;
 
@@ -53,6 +53,10 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(RemeshOptions::default().adaptivity),
+            crease_degrees: std::env::var("OPENRETOPO_CREASE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(RemeshOptions::default().crease_degrees),
             ..RemeshOptions::default()
         },
         Some(&mut cb),

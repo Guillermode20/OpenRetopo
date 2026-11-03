@@ -54,6 +54,8 @@ pub struct LevelGuide {
     /// Mirror partner per node (`INVALID` = none).
     pub partner: Vec<u32>,
     pub plane: Option<MirrorPlane>,
+    /// Crease tangent per node (`None` = not on a crease). Empty = none.
+    pub crease: Vec<Option<Vector3<f64>>>,
 }
 
 fn mean_edge_length(level: &HierarchyLevel) -> f64 {
@@ -431,6 +433,7 @@ pub fn build_guides(
     scale: f64,
     mirror: Option<MirrorPlane>,
     fine_tensors: Option<&[Matrix3<f64>]>,
+    fine_creases: Option<&[Option<Vector3<f64>>]>,
 ) -> Vec<LevelGuide> {
     let n_levels = hier.levels.len();
     let mut guides: Vec<LevelGuide> = vec![LevelGuide::default(); n_levels];
@@ -478,8 +481,54 @@ pub fn build_guides(
             seam_alignment(lv, plane, &mut g.target);
         }
     }
+    if let Some(fine) = fine_creases {
+        if fine.len() == hier.levels[0].positions.len() && fine.iter().any(|t| t.is_some()) {
+            let mut cur: Vec<Option<Vector3<f64>>> = fine.to_vec();
+            for (l, g) in guides.iter_mut().enumerate() {
+                let n = hier.levels[l].positions.len();
+                if g.target.len() != n {
+                    g.target = vec![(Vector3::zeros(), 0.0); n];
+                }
+                let lv = &hier.levels[l];
+                let band = 2.0 * mean_edge_length(lv);
+                for (i, t) in cur.iter().enumerate() {
+                    // the mirror seam has priority near the plane
+                    let near_seam = mirror
+                        .is_some_and(|pl| (lv.positions[i][pl.axis] - pl.offset).abs() < band);
+                    if let (Some(t), false) = (t, near_seam) {
+                        g.target[i] = (*t, CREASE_WEIGHT);
+                    }
+                }
+                if l + 1 < n_levels {
+                    // restrict: sign-aligned sum of the children's tangents
+                    let next = hier.to_upper[l]
+                        .iter()
+                        .map(|&[a, b]| {
+                            let ta = cur[a as usize];
+                            let tb = if b != INVALID { cur[b as usize] } else { None };
+                            match (ta, tb) {
+                                (Some(x), Some(y)) => {
+                                    let s = x + if x.dot(&y) < 0.0 { -y } else { y };
+                                    let l = s.norm();
+                                    (l > 1e-12).then(|| s / l)
+                                }
+                                (x, y) => x.or(y),
+                            }
+                        })
+                        .collect();
+                    g.crease = std::mem::replace(&mut cur, next);
+                } else {
+                    g.crease = std::mem::take(&mut cur);
+                }
+            }
+        }
+    }
     guides
 }
+
+/// Weight of the crease alignment (relative to the neighbour weight sum):
+/// strong, a crease is a hard feature.
+const CREASE_WEIGHT: f64 = 6.0;
 
 /// Weight of the "edges along the mirror plane" prior.
 const SEAM_WEIGHT: f64 = 2.0;

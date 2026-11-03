@@ -100,15 +100,21 @@ pub fn merge_triangles(
         }
         let quad = [x, d, y, c];
         let pts = quad.map(|i| v(positions[i as usize]));
-        let n = face_normal(&[
+        let n0 = face_normal(&[
             v(positions[x as usize]),
             v(positions[y as usize]),
             v(positions[c as usize]),
-        ]) + face_normal(&[
+        ]);
+        let n1 = face_normal(&[
             v(positions[y as usize]),
             v(positions[x as usize]),
             v(positions[d as usize]),
         ]);
+        // never fold a quad over a crease
+        if n0.dot(&n1) < 40f64.to_radians().cos() * n0.norm() * n1.norm() {
+            continue;
+        }
+        let n = n0 + n1;
         if let Some(q) = quad_quality(pts, n) {
             if q < 50f64.to_radians() {
                 candidates.push((q, ts[0], ts[1], quad));
@@ -207,6 +213,62 @@ impl<'a> SurfaceIndex<'a> {
     }
 }
 
+/// Spatial hash of crease segments.
+pub struct CreaseIndex {
+    segs: Vec<(V3, V3)>,
+    cell: f64,
+    grid: HashMap<(i64, i64, i64), Vec<u32>>,
+}
+
+impl CreaseIndex {
+    pub fn new(segs: Vec<(V3, V3)>, cell: f64) -> Self {
+        let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+        let key = |x: f64| (x / cell).floor() as i64;
+        for (si, (a, b)) in segs.iter().enumerate() {
+            let (lo, hi) = (a.inf(b), a.sup(b));
+            for x in key(lo.x)..=key(hi.x) {
+                for y in key(lo.y)..=key(hi.y) {
+                    for z in key(lo.z)..=key(hi.z) {
+                        grid.entry((x, y, z)).or_default().push(si as u32);
+                    }
+                }
+            }
+        }
+        CreaseIndex { segs, cell, grid }
+    }
+
+    /// Distance to and closest point on the nearest segment within about
+    /// one cell.
+    pub fn nearest(&self, p: V3) -> Option<(f64, V3)> {
+        if self.segs.is_empty() {
+            return None;
+        }
+        let k = |x: f64| (x / self.cell).floor() as i64;
+        let (cx, cy, cz) = (k(p.x), k(p.y), k(p.z));
+        let mut best: Option<(f64, V3)> = None;
+        for x in cx - 1..=cx + 1 {
+            for y in cy - 1..=cy + 1 {
+                for z in cz - 1..=cz + 1 {
+                    let Some(list) = self.grid.get(&(x, y, z)) else {
+                        continue;
+                    };
+                    for &si in list {
+                        let (a, b) = self.segs[si as usize];
+                        let ab = b - a;
+                        let t = ((p - a).dot(&ab) / ab.norm_squared().max(1e-30)).clamp(0.0, 1.0);
+                        let q = a + ab * t;
+                        let d = (q - p).norm();
+                        if best.is_none_or(|(bd, _)| d < bd) {
+                            best = Some((d, q));
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
 /// Ericson, Real-Time Collision Detection §5.1.5.
 fn closest_on_triangle(p: V3, a: V3, b: V3, c: V3) -> V3 {
     let (ab, ac, ap) = (b - a, c - a, p - a);
@@ -248,10 +310,42 @@ pub fn relax(
     positions: &mut [[f32; 3]],
     faces: &[Vec<u32>],
     surface: &SurfaceIndex,
+    creases: &CreaseIndex,
     seam: Option<MirrorPlane>,
     iterations: usize,
 ) {
     let n = positions.len();
+    // crease vertices: on (or very near) a crease line. They slide along it
+    // (between their two crease neighbours) instead of over the surface.
+    let h = {
+        let (mut s, mut c) = (0.0, 0usize);
+        for f in faces {
+            for k in 0..f.len() {
+                s += (v(positions[f[k] as usize]) - v(positions[f[(k + 1) % f.len()] as usize]))
+                    .norm();
+                c += 1;
+            }
+        }
+        s / c.max(1) as f64
+    };
+    let on_crease: Vec<bool> = positions
+        .iter()
+        .map(|&p| creases.nearest(v(p)).is_some_and(|(d, _)| d < 0.3 * h))
+        .collect();
+    let mut crease_nbrs: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for f in faces {
+        for k in 0..f.len() {
+            let (a, b) = (f[k], f[(k + 1) % f.len()]);
+            if on_crease[a as usize] && on_crease[b as usize] {
+                crease_nbrs[a as usize].push(b);
+                crease_nbrs[b as usize].push(a);
+            }
+        }
+    }
+    for list in &mut crease_nbrs {
+        list.sort_unstable();
+        list.dedup();
+    }
     let mut incident: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (fi, f) in faces.iter().enumerate() {
         for &vtx in f {
@@ -291,12 +385,18 @@ pub fn relax(
                 continue;
             }
             let nrm = nrm / nl;
-            c /= incident[i].len() as f64;
-            let d = c - pos[i];
-            let mut p = pos[i] + (d - nrm * nrm.dot(&d)) * 0.5;
-            if let Some(q) = surface.project(p, nrm) {
-                p = q;
-            }
+            let mut p = if on_crease[i] {
+                let p = match crease_nbrs[i].as_slice() {
+                    [a, b] => pos[i] + ((pos[*a as usize] + pos[*b as usize]) * 0.5 - pos[i]) * 0.5,
+                    _ => pos[i], // crease corner / end: hold
+                };
+                creases.nearest(p).map_or(p, |(_, q)| q)
+            } else {
+                c /= incident[i].len() as f64;
+                let d = c - pos[i];
+                let p = pos[i] + (d - nrm * nrm.dot(&d)) * 0.5;
+                surface.project(p, nrm).unwrap_or(p)
+            };
             if let Some(s) = seam {
                 if on_seam[i] {
                     p[s.axis] = s.offset;

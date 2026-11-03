@@ -40,6 +40,7 @@ _LIB_SPECS = {
 EXPECTED_ABI = 4
 FLAG_DECIMATE_ONLY = 1
 FLAG_NO_CURVATURE = 2
+FLAG_NO_CREASES = 4
 SYMMETRY_CODES = {"NONE": 0, "X": 1, "Y": 2, "Z": 3, "AUTO": 4}
 
 
@@ -229,7 +230,7 @@ def _extract_triangles(mesh, scale=None):
 
 
 def _native_remesh(positions, indices, target_faces, progress=None, decimate_only=False,
-                   symmetry="NONE", curvature=True, adaptivity=0.0):
+                   symmetry="NONE", curvature=True, adaptivity=0.0, creases=True):
     """Call the engine.
 
     Returns (positions f32[:,3], face_sizes u32[F], indices u32[sum(sizes)], stats dict).
@@ -243,7 +244,11 @@ def _native_remesh(positions, indices, target_faces, progress=None, decimate_onl
     params.weld_epsilon = 0.0  # auto
     params.lock_crease_degrees = 180.0  # disabled for now (M1+ will expose)
     params.symmetry_axis = SYMMETRY_CODES[symmetry]
-    params.flags = (FLAG_DECIMATE_ONLY if decimate_only else 0) | (0 if curvature else FLAG_NO_CURVATURE)
+    params.flags = (
+        (FLAG_DECIMATE_ONLY if decimate_only else 0)
+        | (0 if curvature else FLAG_NO_CURVATURE)
+        | (0 if creases else FLAG_NO_CREASES)
+    )
     params.adaptivity = float(adaptivity)
     params.reserved = (ctypes.c_uint64 * 1)(0)
 
@@ -386,6 +391,12 @@ class OPENRETOPO_OT_remesh(Operator):
         default=True,
         description="Align edge loops with limbs and other tube-like shapes",
     )
+    creases: BoolProperty(
+        name="Keep Sharp Edges",
+        default=True,
+        description="Run edge loops exactly along sharp rims and hard edges (ear rims, fins, "
+        "creases) instead of cutting across them",
+    )
     adaptivity: FloatProperty(
         name="Adaptive Density",
         default=0.6,
@@ -461,6 +472,7 @@ class OPENRETOPO_OT_remesh(Operator):
             "symmetry": self.symmetry,
             "curvature": self.curvature,
             "adaptivity": self.adaptivity,
+            "creases": self.creases,
         }
 
     def _create(self, context, pos, sizes, idx, stats):
@@ -561,10 +573,12 @@ class OPENRETOPO_PT_main(Panel):
         op.symmetry = scene_props.symmetry
         op.curvature = scene_props.curvature
         op.adaptivity = scene_props.adaptivity
+        op.creases = scene_props.creases
 
         col.prop(scene_props, "target_faces")
         col.prop(scene_props, "symmetry")
         col.prop(scene_props, "curvature")
+        col.prop(scene_props, "creases")
         col.prop(scene_props, "adaptivity", slider=True)
         col.separator()
         col.label(text="Closed meshes only (no holes).", icon="INFO")
@@ -593,6 +607,12 @@ class OPENRETOPO_SceneProps(PropertyGroup):
         name="Follow Curvature",
         default=True,
         description="Align edge loops with limbs and other tube-like shapes",
+    )
+    creases: BoolProperty(
+        name="Keep Sharp Edges",
+        default=True,
+        description="Run edge loops exactly along sharp rims and hard edges (ear rims, fins, "
+        "creases) instead of cutting across them",
     )
     adaptivity: FloatProperty(
         name="Adaptive Density",

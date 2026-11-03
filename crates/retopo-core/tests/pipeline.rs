@@ -316,3 +316,47 @@ fn adaptive_density_spends_faces_on_small_features() {
         "adaptive {adaptive} vs uniform {uniform}"
     );
 }
+
+#[test]
+fn crease_rims_get_an_edge_loop_not_a_staircase() {
+    // a sphere squashed into a thin lens: the equator is a sharp rim
+    let (mut p, i) = load("icosphere.obj");
+    for v in p.chunks_mut(3) {
+        v[2] *= 0.05;
+    }
+    let crossing_share = |crease_degrees: f64| {
+        let out = remesh(
+            &p,
+            &i,
+            &RemeshOptions {
+                target_faces: 600,
+                crease_degrees,
+                ..RemeshOptions::default()
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("crease {crease_degrees}: {e}"));
+        assert_eq!(check_closed_manifold(&out), 2);
+        // edges that jump from one face of the lens to the other instead
+        // of running along the rim
+        let z = |v: u32| out.positions[3 * v as usize + 2];
+        let eps = 0.002;
+        let (mut crossing, mut total) = (0usize, 0usize);
+        let mut off = 0;
+        for &n in &out.face_sizes {
+            let f = &out.indices[off..off + n as usize];
+            for k in 0..f.len() {
+                let (a, b) = (f[k], f[(k + 1) % f.len()]);
+                total += 1;
+                crossing += (z(a) > eps && z(b) < -eps || z(a) < -eps && z(b) > eps) as usize;
+            }
+            off += n as usize;
+        }
+        crossing as f64 / total as f64
+    };
+    let (off, on) = (crossing_share(0.0), crossing_share(40.0));
+    assert!(
+        on < 0.5 * off,
+        "rim-crossing edges: crease {on:.4} vs none {off:.4}"
+    );
+}

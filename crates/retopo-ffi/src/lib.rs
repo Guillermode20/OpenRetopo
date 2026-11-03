@@ -35,6 +35,9 @@ pub const FLAG_DECIMATE_ONLY: u32 = 1;
 /// `OpenRetopoParams::flags` bit: disable principal-curvature alignment
 /// (smoothest field only).
 pub const FLAG_NO_CURVATURE: u32 = 2;
+/// `OpenRetopoParams::flags` bit: do not detect sharp creases (thin rims,
+/// hard edges) to align edge loops with.
+pub const FLAG_NO_CREASES: u32 = 4;
 pub const ERR_BUF_LEN: usize = 512;
 
 #[repr(C)]
@@ -334,6 +337,11 @@ unsafe fn remesh_impl(
             0.0
         } else {
             1.0
+        },
+        crease_degrees: if params_value.flags & FLAG_NO_CREASES != 0 {
+            0.0
+        } else {
+            RemeshOptions::default().crease_degrees
         },
         adaptivity: if params_value.adaptivity.is_finite() {
             params_value.adaptivity.clamp(0.0, 1.0) as f64
