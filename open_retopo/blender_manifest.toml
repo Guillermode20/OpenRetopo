@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "open_retopo"
+version = "0.1.0"
+name = "OpenRetopo"
+tagline = "Field-aligned automatic retopology for rigging-ready characters"
+maintainer = "Guillermode20"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["GPL-3.0-or-later"]
+tags = ["Mesh", "Modeling", "Rigging"]

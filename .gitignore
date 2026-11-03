@@ -1,0 +1,9 @@
+/target
+__pycache__/
+*.pyc
+*.blend1
+/dist
+# Native libraries are build artifacts; they ship inside release extension zips.
+open_retopo/native/*/*.so
+open_retopo/native/*/*.dll
+open_retopo/native/*/*.dylib

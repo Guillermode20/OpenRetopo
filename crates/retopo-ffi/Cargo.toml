@@ -1,0 +1,15 @@
+[package]
+name = "openretopo-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "C ABI bridge between OpenRetopo's Rust engine and the Blender addon"
+
+[lib]
+crate-type = ["cdylib"]
+name = "openretopo"
+
+[dependencies]
+openretopo-core = { path = "../retopo-core" }

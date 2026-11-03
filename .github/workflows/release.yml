@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  native:
+    name: Native library (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: linux_x86_64
+            os: ubuntu-24.04
+            build: cargo build --release -p openretopo-ffi
+            src: target/release/libopenretopo.so
+            dest: linux_x86_64/libopenretopo.so
+          - artifact: win_x86_64
+            os: windows-2022
+            build: cargo build --release -p openretopo-ffi
+            src: target/release/openretopo.dll
+            dest: win_x86_64/openretopo.dll
+          - artifact: macos_universal2
+            os: macos-14
+            build: |
+              rustup target add x86_64-apple-darwin aarch64-apple-darwin
+              cargo build --release -p openretopo-ffi --target x86_64-apple-darwin
+              cargo build --release -p openretopo-ffi --target aarch64-apple-darwin
+              lipo -create -output target/libopenretopo-universal.dylib \
+                target/x86_64-apple-darwin/release/libopenretopo.dylib \
+                target/aarch64-apple-darwin/release/libopenretopo.dylib
+              codesign --force --sign - target/libopenretopo-universal.dylib
+            src: target/libopenretopo-universal.dylib
+            dest: macos_universal2/libopenretopo.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: ${{ matrix.build }}
+        shell: bash
+      - name: Stage
+        run: |
+          mkdir -p "native/$(dirname '${{ matrix.dest }}')"
+          cp "${{ matrix.src }}" "native/${{ matrix.dest }}"
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          path: native/
+          if-no-files-found: error
+
+  release:
+    name: Build & publish extension
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: open_retopo/native
+      - name: Install Blender (latest Blender5.2)
+        run: |
+          set -euo pipefail
+          file=$(curl -s "https://download.blender.org/release/Blender5.2/" \
+            | grep -oE 'blender-[0-9]+\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz' | sort -Vu | tail -1)
+          curl -sL "https://download.blender.org/release/Blender5.2/$file" -o /tmp/blender.tar.xz
+          mkdir -p /tmp/blender && tar -xJf /tmp/blender.tar.xz -C /tmp/blender --strip-components=1
+          echo "BLENDER_BIN=/tmp/blender/blender" >> "$GITHUB_ENV"
+      - name: Validate and build multi-platform extension
+        run: |
+          $BLENDER_BIN -b --factory-startup -noaudio --command extension validate open_retopo
+          $BLENDER_BIN -b --factory-startup -noaudio --command extension build --source-dir open_retopo --output-dir dist
+      - name: Generate checksums
+        run: cd dist && sha256sum *.zip > SHA256SUMS.txt
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
