@@ -37,7 +37,7 @@ _LIB_SPECS = {
     ("darwin", "arm64"): ("macos_universal2", "libopenretopo.dylib"),
 }
 
-EXPECTED_ABI = 2
+EXPECTED_ABI = 3
 FLAG_DECIMATE_ONLY = 1
 FLAG_NO_CURVATURE = 2
 SYMMETRY_CODES = {"NONE": 0, "X": 1, "Y": 2, "Z": 3, "AUTO": 4}
@@ -109,6 +109,34 @@ _lib = None
 OPENRETOPO_LAST_STATS = None
 
 
+def _private_copy(path):
+    """Copy the library to a content-addressed temp path and return it.
+
+    The OS caches loaded libraries by path for the life of the process, so
+    after an in-place extension update `CDLL(path)` would silently hand back
+    the *old* engine. Loading a copy named after the file's hash makes an
+    update take effect as soon as the extension is re-enabled. Falls back to
+    the original path if the copy cannot be made.
+    """
+    import hashlib
+    import shutil
+    import tempfile
+
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()[:16]
+        folder = os.path.join(tempfile.gettempdir(), f"openretopo-{digest}")
+        dest = os.path.join(folder, os.path.basename(path))
+        if not os.path.exists(dest):
+            os.makedirs(folder, exist_ok=True)
+            tmp = dest + f".{os.getpid()}.tmp"
+            shutil.copy2(path, tmp)
+            os.replace(tmp, dest)
+        return dest
+    except OSError:
+        return path
+
+
 def _load_library():
     global _lib
     if _lib is not None:
@@ -128,13 +156,14 @@ def _load_library():
             "the result into the addon's native/ folder, or install a release "
             "build from the releases page."
         )
-    lib = ctypes.CDLL(path)
+    lib = ctypes.CDLL(_private_copy(path))
     lib.openretopo_abi_version.restype = ctypes.c_uint32
     lib.openretopo_abi_version.argtypes = []
-    if lib.openretopo_abi_version() != EXPECTED_ABI:
+    found = lib.openretopo_abi_version()
+    if found != EXPECTED_ABI:
         raise NativeRetopologyError(
-            f"OpenRetopo: native library ABI mismatch (expected {EXPECTED_ABI}). "
-            "Rebuild the addon or update the native library."
+            f"OpenRetopo: native library ABI mismatch (addon expects {EXPECTED_ABI}, library is {found}). "
+            "Restart Blender after updating the extension; if that does not help, reinstall it."
         )
     pf, pi = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint32)
     lib.openretopo_remesh.restype = ctypes.c_int32

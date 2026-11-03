@@ -5,7 +5,7 @@ Run with Blender (not the system python):
     blender -b --factory-startup -noaudio --python tools/headless_test.py
 
 Exits 0 on success, 1 on failure. Asserts:
-  * addon registers and the native library loads (ABI v2);
+  * addon registers and the native library loads (ABI match);
   * field-aligned remesh of closed meshes (icosphere, torus) creates a new
     smooth-shaded `<name>_retopo` object that is quad-dominant, closed,
     manifold, has the input's Euler characteristic, and leaves the original

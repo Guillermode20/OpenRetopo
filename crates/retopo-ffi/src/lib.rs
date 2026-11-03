@@ -21,7 +21,11 @@ use openretopo_core::{remesh, RemeshMode, RemeshOptions, RemeshStats, RetopoErro
 /// v2: polygon output (`out_face_sizes`), field-aligned mode by default,
 ///     `flags` bit 0 selects the legacy decimator, stats carry
 ///     `struct_size` and topology/pole fields.
-pub const ABI_VERSION: u32 = 2;
+/// v3: `symmetry_axis` is honoured (0-4, 4 = auto), `FLAG_NO_CURVATURE`,
+///     stats gain `extraction_attempts` and `symmetry_axis` (same size).
+///     Bumped so a stale v2 library — which silently ignores symmetry —
+///     is rejected instead of producing unsymmetric output.
+pub const ABI_VERSION: u32 = 3;
 
 /// `OpenRetopoParams::flags` bit: run the legacy weld + decimate pipeline
 /// instead of field-aligned remeshing.
