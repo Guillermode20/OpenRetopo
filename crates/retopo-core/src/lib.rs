@@ -31,6 +31,8 @@ pub enum RetopoError {
     AllFacesRemoved,
     #[error("cancelled by the user")]
     Cancelled,
+    #[error("the orientation/position field solve diverged (non-finite values); the input may be degenerate or contain opposing face orientations")]
+    FieldDiverged,
 }
 
 #[derive(Debug, Clone, Copy)]

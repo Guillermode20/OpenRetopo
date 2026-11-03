@@ -207,7 +207,7 @@ fn solve_level(
     dirs: &mut [Vector3<f64>],
     max_iterations: u32,
     convergence_degrees: f64,
-) -> u32 {
+) -> Result<u32, crate::RetopoError> {
     let mut iteration = 0u32;
     loop {
         iteration += 1;
@@ -232,12 +232,20 @@ fn solve_level(
                 }
             }
             if weight_sum > 0.0 {
-                max_step = max_step.max(fold_quarter_turns(dirs[i].angle(&sum).to_degrees()));
+                let change = fold_quarter_turns(dirs[i].angle(&sum).to_degrees());
+                max_step = if change.is_finite() {
+                    max_step.max(change)
+                } else {
+                    f64::INFINITY
+                };
                 dirs[i] = sum;
             }
         }
+        if !max_step.is_finite() {
+            return Err(crate::RetopoError::FieldDiverged);
+        }
         if max_step < convergence_degrees || iteration >= max_iterations {
-            return iteration;
+            return Ok(iteration);
         }
     }
 }
@@ -259,7 +267,7 @@ pub fn solve_orientation(
     positions: &[[f64; 3]],
     tris: &[[u32; 3]],
     options: &FieldOptions,
-) -> (OrientationField, FieldStats) {
+) -> Result<(OrientationField, FieldStats), crate::RetopoError> {
     let n = positions.len();
 
     let mut stats = FieldStats {
@@ -303,7 +311,7 @@ pub fn solve_orientation(
         } else {
             options.iterations_per_level
         };
-        let iters = solve_level(lv, &mut d, max_iter, options.convergence_degrees);
+        let iters = solve_level(lv, &mut d, max_iter, options.convergence_degrees)?;
         if level == 0 {
             stats.iterations = iters;
         }
@@ -355,13 +363,13 @@ pub fn solve_orientation(
         }
     }
 
-    (
+    Ok((
         OrientationField {
             directions: dirs,
             normals,
         },
         stats,
-    )
+    ))
 }
 
 /// Fold an angle (in degrees) into the fundamental domain of the 4-RoSy
@@ -438,7 +446,7 @@ mod tests {
 
     fn solve_named(name: &str) -> FieldStats {
         let (pos, tris) = fixture(name);
-        let (field, stats) = solve_orientation(&pos, &tris, &FieldOptions::default());
+        let (field, stats) = solve_orientation(&pos, &tris, &FieldOptions::default()).unwrap();
         assert_eq!(field.directions.len(), pos.len());
         assert!(
             field.directions.iter().all(|d| is_unit(d, 1e-6)),
@@ -550,7 +558,7 @@ mod diagnostics {
                     }
                     init
                 };
-                let iters = solve_level(lv, &mut d, 300, 0.01);
+                let iters = solve_level(lv, &mut d, 300, 0.01).unwrap();
                 let mismatch = level_mismatch(lv, &d);
                 println!(
                     "  level {level:2}: nodes={:5} iters={iters:3} mean_mismatch={mismatch:.3} deg",
@@ -614,7 +622,8 @@ mod diagnostics {
             }
         }
 
-        let (field, stats) = solve_orientation(&positions, &tris, &FieldOptions::default());
+        let (field, stats) =
+            solve_orientation(&positions, &tris, &FieldOptions::default()).unwrap();
         let normals = &field.normals;
 
         let mut flat_sum = 0.0;
@@ -675,7 +684,8 @@ mod cube_debug {
             .iter()
             .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
             .collect();
-        let (field, _) = solve_orientation(&positions, &mesh.triangles, &FieldOptions::default());
+        let (field, _) =
+            solve_orientation(&positions, &mesh.triangles, &FieldOptions::default()).unwrap();
         for (i, d) in field.directions.iter().enumerate() {
             println!("d{i}: ({:.4}, {:.4}, {:.4})", d.x, d.y, d.z);
         }
@@ -720,12 +730,466 @@ mod flat_grid {
     #[test]
     fn flat_grid_solves_to_near_zero() {
         let (pos, tris) = grid(8);
-        let (_field, stats) = solve_orientation(&pos, &tris, &FieldOptions::default());
+        let (_field, stats) = solve_orientation(&pos, &tris, &FieldOptions::default()).unwrap();
         println!("flat grid: {stats:?}");
         assert!(
             stats.mean_edge_error_degrees < 2.0,
             "flat grid residual must be near zero, got {}",
             stats.mean_edge_error_degrees
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// position field
+// ---------------------------------------------------------------------------
+
+/// Per-vertex position-field anchor: a point near the vertex lying in the
+/// tangent plane. The set of anchors tiles the surface with a regular
+/// grid congruent with the orientation field.
+#[derive(Debug, Clone)]
+pub struct PositionField {
+    /// One anchor per input vertex (same indexing as the input mesh).
+    pub anchors: Vec<Vector3<f64>>,
+    /// Target edge length the solve was run with.
+    pub scale: f64,
+}
+
+/// Total surface area of a triangle mesh.
+pub fn surface_area(positions: &[[f64; 3]], tris: &[[u32; 3]]) -> f64 {
+    let mut area = 0.0;
+    for t in tris {
+        let (a, b, c) = (
+            Vector3::from(positions[t[0] as usize]),
+            Vector3::from(positions[t[1] as usize]),
+            Vector3::from(positions[t[2] as usize]),
+        );
+        area += (b - a).cross(&(c - a)).norm() * 0.5;
+    }
+    area
+}
+
+/// Point on both tangent planes closest to the midpoint between the two
+/// surface points — the pivot for the minimal arc rotating frame planes.
+fn middle_point(
+    p0: Vector3<f64>,
+    n0: Vector3<f64>,
+    p1: Vector3<f64>,
+    n1: Vector3<f64>,
+) -> Vector3<f64> {
+    let n0p0 = n0.dot(&p0);
+    let n0p1 = n0.dot(&p1);
+    let n1p0 = n1.dot(&p0);
+    let n1p1 = n1.dot(&p1);
+    let n0n1 = n0.dot(&n1);
+    let denom = 1.0 / (1.0 - n0n1 * n0n1 + 1e-4);
+    let lambda_0 = 2.0 * (n0p1 - n0p0 - n0n1 * (n1p0 - n1p1)) * denom;
+    let lambda_1 = 2.0 * (n1p0 - n1p1 - n0n1 * (n0p1 - n0p0)) * denom;
+
+    0.5 * (p0 + p1) - 0.25 * (n0 * lambda_0 + n1 * lambda_1)
+}
+
+/// Snap `p` onto the lattice defined by frame `(o, q, n)` with `scale`
+/// spacing, returning the snapped lattice point.
+fn position_round_4(
+    o: Vector3<f64>,
+    q: Vector3<f64>,
+    n: Vector3<f64>,
+    p: Vector3<f64>,
+    scale: f64,
+    inv_scale: f64,
+) -> Vector3<f64> {
+    let t = n.cross(&q);
+    let d = p - o;
+    o + q * (q.dot(&d) * inv_scale).round() * scale + t * (t.dot(&d) * inv_scale).round() * scale
+}
+
+/// Compatibility pair for intrinsic position averaging: rotate the
+/// neighbour frame into plane `n0` and snap onto the lattice relative to
+/// the current anchor `o0`.
+fn compat_position_intrinsic_4(
+    p0: Vector3<f64>,
+    n0: Vector3<f64>,
+    _q0: Vector3<f64>,
+    o0: Vector3<f64>,
+    p1: Vector3<f64>,
+    n1: Vector3<f64>,
+    q1_raw: Vector3<f64>,
+    o1_raw: Vector3<f64>,
+    scale: f64,
+    inv_scale: f64,
+) -> (Vector3<f64>, Vector3<f64>) {
+    let cos_theta = n1.dot(&n0);
+    let mut q1 = q1_raw;
+    let mut o1 = o1_raw;
+
+    if cos_theta < 0.9999 {
+        let axis = n1.cross(&n0);
+        let axis_len_sq = axis.dot(&axis);
+        if axis_len_sq > 1e-12 {
+            let factor = (1.0 - cos_theta) / axis_len_sq;
+            let middle = middle_point(p0, n0, p1, n1);
+            o1 -= middle;
+            q1 = q1 * cos_theta + axis.cross(&q1) + axis * (axis.dot(&q1) * factor);
+            o1 = o1 * cos_theta + axis.cross(&o1) + axis * (axis.dot(&o1) * factor) + middle;
+        } else if cos_theta < 0.0 {
+            // exactly antiparallel normals: the rotation axis is ambiguous;
+            // use a 180° turn around any orthonormal perpendicular axis.
+            let arbitrary = if n1.x.abs() < 0.9 {
+                Vector3::new(1.0, 0.0, 0.0)
+            } else {
+                Vector3::new(0.0, 1.0, 0.0)
+            };
+            let k = n1.cross(&arbitrary).normalize();
+            let middle = middle_point(p0, n0, p1, n1);
+            o1 -= middle;
+            q1 = q1 * (-1.0) + k * (k.dot(&q1) * 2.0);
+            o1 = o1 * (-1.0) + k * (k.dot(&o1) * 2.0) + middle;
+        }
+        // else: nearly identical normals — nothing to rotate
+    }
+
+    (o0, position_round_4(o1, q1, n0, o0, scale, inv_scale))
+}
+
+fn position_hash(position: [f64; 3], normal: Vector3<f64>, scale: f64) -> Vector3<f64> {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for c in position {
+        for b in c.to_bits().to_le_bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    let s = (hash as f64 / u64::MAX as f64) * 2.0 - 1.0;
+    let t = ((hash.rotate_left(32)) as f64 / u64::MAX as f64) * 2.0 - 1.0;
+    // orthonormal frame from the normal
+    let arbitrary = if normal.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let t_axis = (arbitrary - normal * normal.dot(&arbitrary)).normalize();
+    let b_axis = normal.cross(&t_axis);
+    Vector3::from(position) + (t_axis * s + b_axis * t) * scale
+}
+
+/// Solve the position field given a solved orientation field. `target_faces`
+/// derives the edge length as `sqrt(surface_area / target_faces)`; pass `0`
+/// to auto-pick one quarter of the input vertex count.
+pub fn solve_position(
+    positions: &[[f64; 3]],
+    tris: &[[u32; 3]],
+    orientation: &OrientationField,
+    target_faces: u32,
+    options: &FieldOptions,
+) -> Result<PositionField, crate::RetopoError> {
+    let n = positions.len();
+    let area = surface_area(positions, tris);
+    let target = if target_faces > 0 {
+        target_faces as f64
+    } else {
+        (n as f64 / 16.0).max(1.0)
+    };
+    let scale = (area / target).sqrt();
+    let inv_scale = 1.0 / scale;
+
+    let hierarchy = Hierarchy::build(positions, tris, 25);
+    let n_levels = hierarchy.levels.len();
+    let mut anchors: Vec<Vec<Vector3<f64>>> = Vec::with_capacity(n_levels);
+    anchors.resize(n_levels, Vec::new());
+
+    for level in (0..n_levels).rev() {
+        let lv = &hierarchy.levels[level];
+        let mut o: Vec<Vector3<f64>> = if level == n_levels - 1 {
+            (0..lv.positions.len())
+                .map(|i| position_hash(lv.positions[i], lv.normals[i], scale))
+                .collect()
+        } else {
+            // project the parent's anchor onto the child's tangent plane
+            // through the child's surface point: o -= n*n.dot(o - v)
+            let mut init = vec![Vector3::zeros(); lv.positions.len()];
+            let up = &hierarchy.to_upper[level];
+            let parent = &anchors[level + 1];
+            for (j, &[a, b]) in up.iter().enumerate() {
+                for &dest in [a, b].iter() {
+                    if dest == hierarchy::INVALID {
+                        continue;
+                    }
+                    let child_pos = Vector3::from(lv.positions[dest as usize]);
+                    let n_child = lv.normals[dest as usize];
+                    let o = parent[j] - n_child * n_child.dot(&(parent[j] - child_pos));
+                    init[dest as usize] = o;
+                }
+            }
+            init
+        };
+
+        let q_dirs: Vec<Vector3<f64>> = if level == 0 {
+            orientation.directions.clone()
+        } else {
+            // coarse levels: re-derive directions with the orientation solver
+            // on that level's graph rather than interpolating level 0's
+            let (sub_field, _) = solve_orientation_for_level(lv, options)?;
+            sub_field
+        };
+
+        let max_iter = if level == 0 {
+            options.max_iterations
+        } else {
+            options.iterations_per_level
+        };
+        solve_position_level(
+            lv,
+            &q_dirs,
+            &mut o,
+            scale,
+            inv_scale,
+            max_iter,
+            options.convergence_degrees,
+        )?;
+        anchors[level] = o;
+    }
+
+    Ok(PositionField {
+        anchors: anchors
+            .into_iter()
+            .next()
+            .expect("at least one hierarchy level"),
+        scale,
+    })
+}
+
+/// Solve the orientation field on an arbitrary hierarchy level (used for
+/// coarse position solves so each level has its own consistent field).
+fn solve_orientation_for_level(
+    level: &HierarchyLevel,
+    options: &FieldOptions,
+) -> Result<(Vec<Vector3<f64>>, u32), crate::RetopoError> {
+    let mut dirs: Vec<Vector3<f64>> = (0..level.positions.len())
+        .map(|i| initial_direction(level.positions[i], level.normals[i]))
+        .collect();
+    let iters = solve_level(
+        level,
+        &mut dirs,
+        options.iterations_per_level,
+        options.convergence_degrees,
+    )?;
+    Ok((dirs, iters))
+}
+
+/// One level of the position solve.
+fn solve_position_level(
+    level: &HierarchyLevel,
+    q_dirs: &[Vector3<f64>],
+    anchors: &mut [Vector3<f64>],
+    scale: f64,
+    inv_scale: f64,
+    max_iterations: u32,
+    convergence_degrees: f64,
+) -> Result<u32, crate::RetopoError> {
+    let convergence_dist = scale * (convergence_degrees.to_radians()).tan();
+    let mut iteration = 0u32;
+    loop {
+        iteration += 1;
+        let mut max_step = 0.0f64;
+        for i in 0..level.positions.len() {
+            if level.adj[i].is_empty() {
+                continue;
+            }
+            let n_i = level.normals[i];
+            let v_i = Vector3::from(level.positions[i]);
+            let q_i = q_dirs[i];
+            let mut sum = anchors[i];
+            let mut weight_sum = 0.0f64;
+            for &(j, w) in &level.adj[i] {
+                let q_j = q_dirs[j as usize];
+                let o_j = anchors[j as usize];
+                let p_j = Vector3::from(level.positions[j as usize]);
+                let (v0, v1) = compat_position_intrinsic_4(
+                    v_i,
+                    n_i,
+                    q_i,
+                    sum,
+                    p_j,
+                    level.normals[j as usize],
+                    q_j,
+                    o_j,
+                    scale,
+                    inv_scale,
+                );
+                sum = v0 * weight_sum + v1 * w;
+                weight_sum += w;
+                if weight_sum > 1e-12 {
+                    sum /= weight_sum;
+                }
+                sum -= n_i * n_i.dot(&(sum - v_i));
+            }
+            let step = (anchors[i] - sum).norm();
+            max_step = if step.is_finite() {
+                max_step.max(step)
+            } else {
+                f64::INFINITY
+            };
+            anchors[i] = sum;
+        }
+        if !max_step.is_finite() {
+            return Err(crate::RetopoError::FieldDiverged);
+        }
+        if max_step < convergence_dist || iteration >= max_iterations {
+            return Ok(iteration);
+        }
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+    use crate::obj;
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name);
+        let mesh = obj::load(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        let positions = mesh
+            .positions
+            .iter()
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .collect();
+        (positions, mesh.triangles)
+    }
+
+    fn grid(n: usize) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+        let mut positions = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                positions.push([x as f64 * 0.1, y as f64 * 0.1, 0.0]);
+            }
+        }
+        let mut tris = Vec::new();
+        let s = n as u32;
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let i = (y * n + x) as u32;
+                tris.push([i, i + 1, i + s + 1]);
+                tris.push([i, i + s + 1, i + s]);
+            }
+        }
+        (positions, tris)
+    }
+
+    #[test]
+    fn flat_grid_lattice_is_exact() {
+        let (pos, tris) = grid(8);
+        let (orient, _) = solve_orientation(&pos, &tris, &FieldOptions::default()).unwrap();
+        let pf = solve_position(&pos, &tris, &orient, 49, &FieldOptions::default()).unwrap();
+        assert!((pf.scale - 0.1).abs() < 1e-9);
+        // anchors must stay on the z=0 plane
+        assert!(pf.anchors.iter().all(|a| a.z.abs() < 1e-9));
+        // the field is globally consistent (flat sheet admits a perfect
+        // solution): anchor pairwise differences lie on the solved lattice
+        let axis = Vector3::new(orient.directions[0].x, orient.directions[0].y, 0.0).normalize();
+        let perp = Vector3::new(-axis.y, axis.x, 0.0);
+        let k = |v: f64| v / 0.1;
+        for i in 0..pf.anchors.len() {
+            for j in i + 1..pf.anchors.len() {
+                let d = pf.anchors[i] - pf.anchors[j];
+                let du = k(d.dot(&axis));
+                let dv = k(d.dot(&perp));
+                assert!(
+                    (du - du.round()).abs() < 1e-6,
+                    "off-lattice u between {i} and {j}"
+                );
+                assert!(
+                    (dv - dv.round()).abs() < 1e-6,
+                    "off-lattice v between {i} and {j}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn positions_are_finite_on_fixtures() {
+        for name in [
+            "uv_sphere.obj",
+            "icosphere.obj",
+            "suzanne.obj",
+            "torus.obj",
+            "cube.obj",
+        ] {
+            let (pos, tris) = fixture(name);
+            let (orient, _) = solve_orientation(&pos, &tris, &FieldOptions::default()).unwrap();
+            let pf = solve_position(&pos, &tris, &orient, 2000, &FieldOptions::default()).unwrap();
+            let finite = pf.anchors.iter().all(|a| a.norm().is_finite());
+            println!("{name}: scale={:.4} finite={finite}", pf.scale);
+            assert!(finite);
+        }
+    }
+}
+
+#[cfg(test)]
+mod position_debug {
+    use super::*;
+    use crate::obj;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cube_position_trace() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cube.obj");
+        let mesh = obj::load(&path).unwrap();
+        let positions: Vec<[f64; 3]> = mesh
+            .positions
+            .iter()
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .collect();
+        let tris = mesh.triangles;
+        let (orient, _) = solve_orientation(&positions, &tris, &FieldOptions::default()).unwrap();
+        let area = surface_area(&positions, &tris);
+        let scale = (area / 2000.0f64).sqrt();
+        let _ = scale;
+        let hier = Hierarchy::build(&positions, &tris, 25);
+        let n_levels = hier.levels.len();
+        let mut anchors: Vec<Vec<Vector3<f64>>> = Vec::with_capacity(n_levels);
+        anchors.resize(n_levels, Vec::new());
+        for level in (0..n_levels).rev() {
+            let lv = &hier.levels[level];
+            let mut o: Vec<Vector3<f64>> = if level == n_levels - 1 {
+                (0..lv.positions.len())
+                    .map(|i| position_hash(lv.positions[i], lv.normals[i], 0.1))
+                    .collect()
+            } else {
+                let mut init = vec![Vector3::zeros(); lv.positions.len()];
+                let up = &hier.to_upper[level];
+                let parent = &anchors[level + 1];
+                for (j, &[a, b]) in up.iter().enumerate() {
+                    for &dest in [a, b].iter() {
+                        if dest == hierarchy::INVALID {
+                            continue;
+                        }
+                        let child_pos = Vector3::from(lv.positions[dest as usize]);
+                        let n_child = lv.normals[dest as usize];
+                        let op = parent[j] - n_child * n_child.dot(&(parent[j] - child_pos));
+                        init[dest as usize] = op;
+                    }
+                }
+                init
+            };
+            let (q_dirs, _) = if level == 0 {
+                (orient.directions.clone(), 0)
+            } else {
+                solve_orientation_for_level(lv, &FieldOptions::default()).unwrap()
+            };
+            println!("level {level} anchors pre-solve: {:?}", o);
+            println!("level {level} q_dirs: {:?}", q_dirs);
+            println!("level {level} adj: {:?}", lv.adj);
+            let sc = (area / 2000.0f64).sqrt();
+            let iters = solve_position_level(lv, &q_dirs, &mut o, sc, 1.0 / sc, 25, 0.1).unwrap();
+            let max_o = o.iter().map(|a| a.norm()).fold(0.0f64, f64::max);
+            let min_o = o.iter().map(|a| a.norm()).fold(f64::INFINITY, f64::min);
+            let nonfinite = o.iter().filter(|a| !a.norm().is_finite()).count();
+            println!("level {level}: nodes={} iters={iters} max|o|={max_o:.3} min|o|={min_o:.3} nonfinite={nonfinite}", lv.positions.len());
+            anchors[level] = o;
+        }
     }
 }

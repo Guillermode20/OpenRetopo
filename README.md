@@ -8,7 +8,7 @@ symmetry-aware solving, and density weighting for deformation regions
 (shoulders, elbows, knees, hips, face). Built for riggers, not just for
 pretty renders.
 
-> **Status — active development (M2a done: orientation field).**
+> **Status — active development (M2a+M2b done: orientation & position fields).**
 > What works today: native engine end-to-end (mesh welding, degenerate/
 > duplicate face removal, quadric decimation with boundary & crease
 > locking), a deterministic 4-RoSy cross-field orientation solver on a
@@ -110,7 +110,7 @@ Blender mesh ──foreach_get──> numpy float32/uint32
 | M0 | Scaffold, C ABI bridge, weld/degenerate/duplicate cleanup, quadric decimation, installable extension, CI/release | ✅ done |
 | M2a | 4-RoSy orientation field: coarse-to-fine primal-graph hierarchy, deterministic, fixture-tested (flat sheet → 0° residual) | ✅ done |
 | M1 | Geometry kernel: curvature & crease analysis, BVH surface projection (needed by extraction & relaxation) | ▶ next |
-| M2b | Position field on the same hierarchy; Poincaré–Hopf validation; debug visualisation | |
+| M2b | Position field on the same hierarchy; exact-lattice validation on a flat sheet; antiparallel-normal fix (180° rotation), fail-hard on divergence | ✅ done |
 | M3 | Dual-graph collapsing + face tracing extraction → first field-aligned quad output | |
 | M4 | Relaxation, surface snapping, pole reduction, boundary handling, stats | |
 | M5 | **v1.0** — X/Y/Z symmetry (half-solve + mirror stitch), vertex-group density weighting, crease toggle, presets, packaging | |
