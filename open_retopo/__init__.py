@@ -20,7 +20,7 @@ import threading
 import numpy as np
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 EXT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +37,7 @@ _LIB_SPECS = {
     ("darwin", "arm64"): ("macos_universal2", "libopenretopo.dylib"),
 }
 
-EXPECTED_ABI = 3
+EXPECTED_ABI = 4
 FLAG_DECIMATE_ONLY = 1
 FLAG_NO_CURVATURE = 2
 SYMMETRY_CODES = {"NONE": 0, "X": 1, "Y": 2, "Z": 3, "AUTO": 4}
@@ -51,7 +51,9 @@ class OpenRetopoParams(ctypes.Structure):
         ("lock_crease_degrees", ctypes.c_float),
         ("symmetry_axis", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint64 * 2),
+        ("adaptivity", ctypes.c_float),
+        ("_pad", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint64 * 1),
     ]
 
 
@@ -227,7 +229,7 @@ def _extract_triangles(mesh, scale=None):
 
 
 def _native_remesh(positions, indices, target_faces, progress=None, decimate_only=False,
-                   symmetry="NONE", curvature=True):
+                   symmetry="NONE", curvature=True, adaptivity=0.0):
     """Call the engine.
 
     Returns (positions f32[:,3], face_sizes u32[F], indices u32[sum(sizes)], stats dict).
@@ -242,7 +244,8 @@ def _native_remesh(positions, indices, target_faces, progress=None, decimate_onl
     params.lock_crease_degrees = 180.0  # disabled for now (M1+ will expose)
     params.symmetry_axis = SYMMETRY_CODES[symmetry]
     params.flags = (FLAG_DECIMATE_ONLY if decimate_only else 0) | (0 if curvature else FLAG_NO_CURVATURE)
-    params.reserved = (ctypes.c_uint64 * 2)(0, 0)
+    params.adaptivity = float(adaptivity)
+    params.reserved = (ctypes.c_uint64 * 1)(0)
 
     out_pos = pf()
     out_idx = pi()
@@ -383,6 +386,15 @@ class OPENRETOPO_OT_remesh(Operator):
         default=True,
         description="Align edge loops with limbs and other tube-like shapes",
     )
+    adaptivity: FloatProperty(
+        name="Adaptive Density",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        description="Spend faces where the surface is detailed (ears, hands, joints) "
+        "and fewer on broad, flat areas. 0 gives uniform quads",
+    )
     sync: BoolProperty(
         name="Run Synchronously",
         default=False,
@@ -448,6 +460,7 @@ class OPENRETOPO_OT_remesh(Operator):
             "decimate_only": self.mode == "DECIMATE",
             "symmetry": self.symmetry,
             "curvature": self.curvature,
+            "adaptivity": self.adaptivity,
         }
 
     def _create(self, context, pos, sizes, idx, stats):
@@ -547,10 +560,12 @@ class OPENRETOPO_PT_main(Panel):
         op.target_faces = scene_props.target_faces
         op.symmetry = scene_props.symmetry
         op.curvature = scene_props.curvature
+        op.adaptivity = scene_props.adaptivity
 
         col.prop(scene_props, "target_faces")
         col.prop(scene_props, "symmetry")
         col.prop(scene_props, "curvature")
+        col.prop(scene_props, "adaptivity", slider=True)
         col.separator()
         col.label(text="Closed meshes only (no holes).", icon="INFO")
 
@@ -578,6 +593,15 @@ class OPENRETOPO_SceneProps(PropertyGroup):
         name="Follow Curvature",
         default=True,
         description="Align edge loops with limbs and other tube-like shapes",
+    )
+    adaptivity: FloatProperty(
+        name="Adaptive Density",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        description="Spend faces where the surface is detailed (ears, hands, joints) "
+        "and fewer on broad, flat areas. 0 gives uniform quads",
     )
 
 

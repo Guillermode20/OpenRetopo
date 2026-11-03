@@ -4,7 +4,8 @@
 //!
 //! Stages are delimited by the progress milestones `remesh()` reports
 //! (weld 0.25, subdivide 0.30, orientation 0.55, position 0.80,
-//! extraction 0.97). Env: OPENRETOPO_SYM=none|auto|x|y|z, OPENRETOPO_CURV=<weight>.
+//! extraction 0.97). Env: OPENRETOPO_SYM=none|auto|x|y|z, OPENRETOPO_CURV=<weight>,
+//! OPENRETOPO_ADAPT=<0..1>.
 
 use std::time::Instant;
 
@@ -48,6 +49,10 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
+            adaptivity: std::env::var("OPENRETOPO_ADAPT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(RemeshOptions::default().adaptivity),
             ..RemeshOptions::default()
         },
         Some(&mut cb),

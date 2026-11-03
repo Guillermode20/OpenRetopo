@@ -851,8 +851,10 @@ mod flat_grid {
 pub struct PositionField {
     /// One anchor per input vertex (same indexing as the input mesh).
     pub anchors: Vec<Vector3<f64>>,
-    /// Target edge length the solve was run with.
+    /// Mean target edge length the solve was run with.
     pub scale: f64,
+    /// Per-vertex target edge length (all equal to `scale` when uniform).
+    pub scales: Vec<f64>,
 }
 
 /// Total surface area of a triangle mesh.
@@ -1012,25 +1014,57 @@ pub fn solve_position(
     let inv_scale = 1.0 / scale;
 
     if options.hierarchical_positions {
-        let o = solve_position_hierarchical(positions, tris, orientation, scale, options)?;
-        return Ok(PositionField { anchors: o, scale });
+        let scales = vec![scale; n];
+        let o = solve_position_hierarchical(positions, tris, orientation, &scales, options)?;
+        return Ok(PositionField {
+            anchors: o,
+            scale,
+            scales,
+        });
     }
     let level = hierarchy::level_from_mesh(positions, tris);
     let mut o: Vec<Vector3<f64>> = (0..level.positions.len())
         .map(|i| position_hash(level.positions[i], level.normals[i], scale))
         .collect();
+    let _ = inv_scale;
+    let scales = vec![scale; n];
     solve_position_level(
         &level,
         &LevelGuide::default(),
         &orientation.directions,
         &mut o,
-        scale,
-        inv_scale,
+        &scales,
         options.max_iterations,
         options.convergence_degrees,
     )?;
 
-    Ok(PositionField { anchors: o, scale })
+    Ok(PositionField {
+        anchors: o,
+        scale,
+        scales,
+    })
+}
+
+/// Position solve with a per-vertex target edge length (density field,
+/// see [`crate::guidance::adaptive_scales`]). `scales` is indexed like
+/// `positions`.
+pub fn solve_position_adaptive(
+    positions: &[[f64; 3]],
+    tris: &[[u32; 3]],
+    orientation: &OrientationField,
+    scales: &[f64],
+    options: &FieldOptions,
+) -> Result<PositionField, crate::RetopoError> {
+    assert_eq!(scales.len(), positions.len(), "one scale per vertex");
+    let areas = hierarchy::dual_areas(positions, tris);
+    let total: f64 = areas.iter().sum();
+    let mean = areas.iter().zip(scales).map(|(a, s)| a * s).sum::<f64>() / total.max(1e-300);
+    let o = solve_position_hierarchical(positions, tris, orientation, scales, options)?;
+    Ok(PositionField {
+        anchors: o,
+        scale: mean,
+        scales: scales.to_vec(),
+    })
 }
 
 /// Restrict the fine orientation field down the hierarchy: each coarse node
@@ -1071,12 +1105,34 @@ fn solve_position_hierarchical(
     positions: &[[f64; 3]],
     tris: &[[u32; 3]],
     orientation: &OrientationField,
-    scale: f64,
+    fine_scales: &[f64],
     options: &FieldOptions,
 ) -> Result<Vec<Vector3<f64>>, crate::RetopoError> {
-    let inv_scale = 1.0 / scale;
     let hier = Hierarchy::build(positions, tris, 25);
     let q = restrict_orientation(&hier, &orientation.directions);
+    // per-level scales: area-weighted mean of the (up to two) children
+    let mut level_scales: Vec<Vec<f64>> = vec![fine_scales.to_vec()];
+    for l in 0..hier.levels.len() - 1 {
+        let (src, lv) = (&level_scales[l], &hier.levels[l]);
+        let next: Vec<f64> = hier.to_upper[l]
+            .iter()
+            .map(|&[a, b]| {
+                let (wa, mut acc, mut w) = (lv.areas[a as usize], 0.0, 0.0);
+                acc += src[a as usize] * wa;
+                w += wa;
+                if b != hierarchy::INVALID {
+                    acc += src[b as usize] * lv.areas[b as usize];
+                    w += lv.areas[b as usize];
+                }
+                if w > 0.0 {
+                    acc / w
+                } else {
+                    src[a as usize]
+                }
+            })
+            .collect();
+        level_scales.push(next);
+    }
     let guides = guidance::build_guides(&hier, 0.0, 0.0, options.mirror, None);
     let n_levels = hier.levels.len();
     let mut o: Vec<Vector3<f64>> = Vec::new();
@@ -1084,7 +1140,7 @@ fn solve_position_hierarchical(
         let lv = &hier.levels[level];
         if level == n_levels - 1 {
             o = (0..lv.positions.len())
-                .map(|i| position_hash(lv.positions[i], lv.normals[i], scale))
+                .map(|i| position_hash(lv.positions[i], lv.normals[i], level_scales[level][i]))
                 .collect();
         } else {
             let mut init = vec![Vector3::zeros(); lv.positions.len()];
@@ -1110,8 +1166,7 @@ fn solve_position_hierarchical(
             &guides[level],
             &q[level],
             &mut o,
-            scale,
-            inv_scale,
+            &level_scales[level],
             iters,
             options.convergence_degrees,
         )?;
@@ -1126,13 +1181,13 @@ fn solve_position_level(
     guide: &LevelGuide,
     q_dirs: &[Vector3<f64>],
     anchors: &mut [Vector3<f64>],
-    scale: f64,
-    inv_scale: f64,
+    scales: &[f64],
     max_iterations: u32,
     convergence_degrees: f64,
 ) -> Result<u32, crate::RetopoError> {
     let phases = color_graph(&level.adj);
-    let convergence_dist = scale * (convergence_degrees.to_radians()).tan();
+    let min_scale = scales.iter().copied().fold(f64::INFINITY, f64::min);
+    let convergence_dist = min_scale * (convergence_degrees.to_radians()).tan();
     let mut iteration = 0u32;
     loop {
         iteration += 1;
@@ -1145,9 +1200,13 @@ fn solve_position_level(
                 let n_i = level.normals[i];
                 let v_i = Vector3::from(level.positions[i]);
                 let q_i = q_dirs[i];
+                let s_i = scales[i];
                 let mut sum = anchors[i];
                 let mut weight_sum = 0.0f64;
                 for &(j, w) in &level.adj[i] {
+                    // neighbouring lattices of different spacing meet halfway
+                    let scale = 0.5 * (s_i + scales[j as usize]);
+                    let inv_scale = 1.0 / scale;
                     let q_j = q_dirs[j as usize];
                     let o_j = anchors[j as usize];
                     let p_j = Vector3::from(level.positions[j as usize]);
@@ -1178,6 +1237,8 @@ fn solve_position_level(
                     if p != hierarchy::INVALID && weight_sum > 0.0 {
                         let pu = p as usize;
                         let w = weight_sum;
+                        let scale = 0.5 * (s_i + scales[pu]);
+                        let inv_scale = 1.0 / scale;
                         let (v0, v1) = compat_position_intrinsic_4(
                             FrameProbe {
                                 p: v_i,
@@ -1201,7 +1262,7 @@ fn solve_position_level(
                 // Re-anchor: pick the lattice point (with origin `sum`) closest
                 // to the vertex itself. Without this the anchor drifts freely
                 // along the lattice and every extra sweep diffuses the field.
-                let sum = position_round_4(sum, q_i, n_i, v_i, scale, inv_scale);
+                let sum = position_round_4(sum, q_i, n_i, v_i, s_i, 1.0 / s_i);
                 let step = (anchors[i] - sum).norm();
                 max_step = if step.is_finite() {
                     max_step.max(step)

@@ -239,3 +239,50 @@ fn fixture_report() {
         }
     }
 }
+
+#[test]
+fn adaptive_density_spends_faces_on_small_features() {
+    // a big sphere and a small one (radius 0.3) side by side: uniform
+    // density gives the small one ~area share (8%), adaptive more
+    let (p, i) = load("icosphere.obj");
+    let nv = (p.len() / 3) as u32;
+    let mut pos = p.clone();
+    pos.extend(
+        p.chunks(3)
+            .flat_map(|v| [v[0] * 0.3 + 3.0, v[1] * 0.3, v[2] * 0.3]),
+    );
+    let mut idx = i.clone();
+    idx.extend(i.iter().map(|k| k + nv));
+    let small_share = |adaptivity: f64| {
+        let out = remesh(
+            &pos,
+            &idx,
+            &RemeshOptions {
+                target_faces: 800,
+                adaptivity,
+                ..RemeshOptions::default()
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("adaptivity {adaptivity}: {e}"));
+        assert_eq!(check_closed_manifold(&out), 4);
+        let mut off = 0usize;
+        let mut small = 0usize;
+        for &n in &out.face_sizes {
+            let x: f32 = out.indices[off..off + n as usize]
+                .iter()
+                .map(|&v| out.positions[3 * v as usize])
+                .sum::<f32>()
+                / n as f32;
+            small += (x > 2.0) as usize;
+            off += n as usize;
+        }
+        small as f64 / out.face_sizes.len() as f64
+    };
+    let (uniform, adaptive) = (small_share(0.0), small_share(1.0));
+    assert!(uniform < 0.13, "uniform share {uniform}");
+    assert!(
+        adaptive > uniform * 1.5,
+        "adaptive {adaptive} vs uniform {uniform}"
+    );
+}

@@ -25,7 +25,9 @@ use openretopo_core::{remesh, RemeshMode, RemeshOptions, RemeshStats, RetopoErro
 ///     stats gain `extraction_attempts` and `symmetry_axis` (same size).
 ///     Bumped so a stale v2 library — which silently ignores symmetry —
 ///     is rejected instead of producing unsymmetric output.
-pub const ABI_VERSION: u32 = 3;
+/// v4: `adaptivity` (curvature-adaptive density, 0-1) takes the first
+///     reserved slot of `OpenRetopoParams` (same size).
+pub const ABI_VERSION: u32 = 4;
 
 /// `OpenRetopoParams::flags` bit: run the legacy weld + decimate pipeline
 /// instead of field-aligned remeshing.
@@ -54,7 +56,11 @@ pub struct OpenRetopoParams {
     pub symmetry_axis: u32,
     /// Feature flags, see `FLAG_*`.
     pub flags: u32,
-    pub reserved: [u64; 2],
+    /// Curvature-adaptive density, 0 (uniform) to 1 (strongest); values
+    /// outside are clamped, non-finite ones rejected.
+    pub adaptivity: f32,
+    pub _pad: u32,
+    pub reserved: [u64; 1],
 }
 
 impl Default for OpenRetopoParams {
@@ -66,7 +72,9 @@ impl Default for OpenRetopoParams {
             lock_crease_degrees: 180.0,
             symmetry_axis: 0,
             flags: 0,
-            reserved: [0; 2],
+            adaptivity: 0.0,
+            _pad: 0,
+            reserved: [0; 1],
         }
     }
 }
@@ -326,6 +334,12 @@ unsafe fn remesh_impl(
             0.0
         } else {
             1.0
+        },
+        adaptivity: if params_value.adaptivity.is_finite() {
+            params_value.adaptivity.clamp(0.0, 1.0) as f64
+        } else {
+            write_err(err_buf, err_buf_len, "adaptivity must be finite");
+            return ERR_INVALID_ARG;
         },
         ..RemeshOptions::default()
     };

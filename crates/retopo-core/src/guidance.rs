@@ -313,6 +313,82 @@ pub fn principal_target(s: &Matrix3<f64>, n: Vector3<f64>, scale: f64) -> (Vecto
     (dir, w * w)
 }
 
+/// Principal curvatures `(k_a, k_b)` of a shape tensor in the tangent plane.
+fn principal_curvatures(s: &Matrix3<f64>, n: Vector3<f64>) -> (f64, f64) {
+    let (u, v) = tangent_basis(n);
+    let a = u.dot(&(s * u));
+    let b = u.dot(&(s * v));
+    let d = v.dot(&(s * v));
+    let eig = Matrix2::new(a, b, b, d).symmetric_eigen();
+    (eig.eigenvalues[0], eig.eigenvalues[1])
+}
+
+/// Spatially varying target edge length ("density field").
+///
+/// Curved detail (ears, fingers, feet, faces, the creases at elbows and
+/// knees) gets smaller quads; broad, flat areas get larger ones. The raw
+/// size follows `(curvedness·s0 + u0)^-γ`, is clamped to
+/// `[s0/max_ratio, s0·max_ratio]`, diffused in log space (so it changes
+/// gradually — no abrupt seams), and renormalised so the expected face
+/// count `Σ area / h²` still matches `target_faces`.
+///
+/// `adaptivity` ∈ [0, 1]: 0 = uniform (every value `s0`), 1 = strong.
+pub fn adaptive_scales(
+    level: &HierarchyLevel,
+    tensors: &[Matrix3<f64>],
+    target_faces: f64,
+    adaptivity: f64,
+) -> Vec<f64> {
+    let n = level.positions.len();
+    let area: f64 = level.areas.iter().sum();
+    let s0 = (area / target_faces.max(1.0)).sqrt();
+    if adaptivity <= 0.0 || n == 0 || !(s0.is_finite() && s0 > 0.0) {
+        return vec![s0; n];
+    }
+    let adaptivity = adaptivity.min(1.0);
+    let gamma = 0.75 * adaptivity;
+    let max_ratio = 1.0 + 2.0 * adaptivity; // up to 3x either way
+    const U0: f64 = 0.15;
+    let mut log_h: Vec<f64> = (0..n)
+        .map(|i| {
+            let (ka, kb) = principal_curvatures(&tensors[i], level.normals[i]);
+            let u = (ka * ka + kb * kb).sqrt() * s0;
+            let u = if u.is_finite() { u } else { 0.0 };
+            -gamma * (u + U0).ln()
+        })
+        .collect();
+    // gradual transitions: diffuse over a few edge lengths
+    let passes = (2 * smoothing_for(level, s0)).clamp(4, 60);
+    for _ in 0..passes {
+        let prev = log_h.clone();
+        for i in 0..n {
+            let mut acc = prev[i] * level.areas[i];
+            let mut w = level.areas[i];
+            for &(j, _) in &level.adj[i] {
+                acc += prev[j as usize] * level.areas[j as usize];
+                w += level.areas[j as usize];
+            }
+            if w > 0.0 {
+                log_h[i] = acc / w;
+            }
+        }
+    }
+    // normalise to the face budget, clamping the ratio to s0
+    let mut shift = 0.0;
+    let (lo, hi) = ((s0 / max_ratio).ln(), (s0 * max_ratio).ln());
+    for _ in 0..8 {
+        let faces: f64 = (0..n)
+            .map(|i| level.areas[i] / (2.0 * (log_h[i] + shift).clamp(lo, hi)).exp())
+            .sum();
+        // faces ∝ h^-2  →  multiply h by sqrt(faces / target)
+        shift += 0.5 * (faces / target_faces).ln();
+    }
+    log_h
+        .iter()
+        .map(|&l| (l + shift).clamp(lo, hi).exp())
+        .collect()
+}
+
 /// Build per-level guidance for a hierarchy.
 ///
 /// `curvature_weight` scales the curvature pull (0 disables it); `scale`
@@ -364,11 +440,52 @@ pub fn build_guides(
     }
     if let Some(plane) = mirror {
         for (l, g) in guides.iter_mut().enumerate() {
-            g.partner = mirror_partners(&hier.levels[l], plane);
+            let lv = &hier.levels[l];
+            g.partner = mirror_partners(lv, plane);
             g.plane = Some(plane);
+            seam_alignment(lv, plane, &mut g.target);
         }
     }
     guides
+}
+
+/// Weight of the "edges along the mirror plane" prior.
+const SEAM_WEIGHT: f64 = 0.5;
+
+/// A reflection maps a 4-RoSy cross onto itself both when it is aligned
+/// with the mirror plane and when it is at 45° to it, so mirror coupling
+/// alone leaves flat symmetric regions (a torso) free to settle on the
+/// diagonal — and which one wins flips with tiny changes to the input.
+/// Pin the cross near the plane to the plane (a centre edge loop, as an
+/// artist would draw), where curvature does not already prescribe one.
+fn seam_alignment(lv: &HierarchyLevel, plane: MirrorPlane, target: &mut Vec<(Vector3<f64>, f64)>) {
+    let n = lv.positions.len();
+    if target.len() != n {
+        target.clear();
+        target.resize(n, (Vector3::zeros(), 0.0));
+    }
+    let band = 1.5 * mean_edge_length(lv);
+    if band.is_nan() || band <= 0.0 {
+        return;
+    }
+    let mut axis = Vector3::zeros();
+    axis[plane.axis] = 1.0;
+    for (i, tgt) in target.iter_mut().enumerate() {
+        let d = (lv.positions[i][plane.axis] - plane.offset).abs();
+        if d >= band {
+            continue;
+        }
+        let nrm = lv.normals[i];
+        let t = axis - nrm * nrm.dot(&axis);
+        let tl = t.norm();
+        if tl < 0.5 {
+            continue; // surface nearly parallel to the plane: no seam here
+        }
+        let w = SEAM_WEIGHT * (1.0 - d / band) * tl;
+        if w > tgt.1 {
+            *tgt = (t / tl, w);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +537,35 @@ mod tests {
         // 4-RoSy: aligned with axis or with circumference — both fine
         let axial = d.z.abs();
         assert!(axial > 0.95 || axial < 0.05, "direction {d:?}");
+    }
+
+    #[test]
+    fn density_puts_more_faces_on_thin_parts() {
+        // thick tube (r = 1) joined in series with a thin one (r = 0.25):
+        // build both, measure mean scale per part
+        let (p1, t1) = tube(1.0, 4.0, 48, 24);
+        let (mut p2, t2) = tube(0.25, 4.0, 24, 48);
+        for v in &mut p2 {
+            v[0] += 5.0;
+        }
+        let off = p1.len() as u32;
+        let mut p = p1.clone();
+        p.extend(p2);
+        let mut t = t1.clone();
+        t.extend(t2.iter().map(|f| [f[0] + off, f[1] + off, f[2] + off]));
+        let lv = level_from_mesh(&p, &t);
+        let tens = curvature_tensors(&lv, 2);
+        let h = adaptive_scales(&lv, &tens, 1500.0, 1.0);
+        let mean =
+            |r: std::ops::Range<usize>| r.clone().map(|i| h[i]).sum::<f64>() / r.len() as f64;
+        let (thick, thin) = (mean(0..p1.len()), mean(p1.len()..p.len()));
+        assert!(thin < thick * 0.75, "thin {thin} thick {thick}");
+        // face budget preserved (within the clamp's slack)
+        let faces: f64 = (0..p.len()).map(|i| lv.areas[i] / (h[i] * h[i])).sum();
+        assert!((faces / 1500.0 - 1.0).abs() < 0.1, "faces {faces}");
+        // adaptivity 0 is uniform
+        let u = adaptive_scales(&lv, &tens, 1500.0, 0.0);
+        assert!(u.iter().all(|&x| (x - u[0]).abs() < 1e-12));
     }
 
     #[test]

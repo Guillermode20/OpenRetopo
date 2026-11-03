@@ -61,6 +61,25 @@ pub fn subdivide_long_edges_with_parents(
     if max_length <= 0.0 || !max_length.is_finite() {
         return Some(0);
     }
+    let mut limits = vec![max_length; positions.len()];
+    subdivide_adaptive(positions, tris, &mut limits, max_vertices, parents)
+}
+
+/// Spatially varying refinement: edge `(a, b)` is split while longer than
+/// `min(limits[a], limits[b])`. New vertices get the mean of their parents'
+/// limits (appended to `limits`) and their split edge appended to
+/// `parents`. Returns `None` if `max_vertices` would be exceeded.
+pub fn subdivide_adaptive(
+    positions: &mut Vec<[f64; 3]>,
+    tris: &mut Vec<[u32; 3]>,
+    limits: &mut Vec<f64>,
+    max_vertices: usize,
+    parents: &mut Vec<[u32; 2]>,
+) -> Option<usize> {
+    assert_eq!(limits.len(), positions.len(), "one limit per vertex");
+    if limits.iter().any(|l| !(l.is_finite() && *l > 0.0)) {
+        return Some(0);
+    }
     // directed edge -> face
     let mut half: HashMap<(u32, u32), u32> = HashMap::with_capacity(tris.len() * 3);
     for (fi, t) in tris.iter().enumerate() {
@@ -72,10 +91,11 @@ pub fn subdivide_long_edges_with_parents(
     let mut heap: BinaryHeap<(u64, std::cmp::Reverse<(u32, u32)>)> = BinaryHeap::new();
     let push = |heap: &mut BinaryHeap<(u64, std::cmp::Reverse<(u32, u32)>)>,
                 positions: &[[f64; 3]],
+                limits: &[f64],
                 a: u32,
                 b: u32| {
         let len = dist(positions[a as usize], positions[b as usize]);
-        if len > max_length {
+        if len > limits[a as usize].min(limits[b as usize]) {
             heap.push((len.to_bits(), std::cmp::Reverse((a.min(b), a.max(b)))));
         }
     };
@@ -83,7 +103,7 @@ pub fn subdivide_long_edges_with_parents(
         for k in 0..3 {
             let (a, b) = (t[k], t[(k + 1) % 3]);
             if a < b || !half.contains_key(&(b, a)) {
-                push(&mut heap, positions, a, b);
+                push(&mut heap, positions, limits, a, b);
             }
         }
     }
@@ -106,6 +126,7 @@ pub fn subdivide_long_edges_with_parents(
         let pb = positions[b as usize];
         let vn = positions.len() as u32;
         parents.push([a, b]);
+        limits.push(0.5 * (limits[a as usize] + limits[b as usize]));
         positions.push([
             (pa[0] + pb[0]) * 0.5,
             (pa[1] + pb[1]) * 0.5,
@@ -130,10 +151,10 @@ pub fn subdivide_long_edges_with_parents(
             half.insert((vn, y), nf);
             half.insert((y, c), nf);
             half.insert((c, vn), nf);
-            push(&mut heap, positions, vn, c);
+            push(&mut heap, positions, limits, vn, c);
         }
-        push(&mut heap, positions, a, vn);
-        push(&mut heap, positions, vn, b);
+        push(&mut heap, positions, limits, a, vn);
+        push(&mut heap, positions, limits, vn, b);
         splits += 1;
     }
     Some(splits)

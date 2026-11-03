@@ -77,6 +77,10 @@ pub struct RemeshOptions {
     /// Strength of principal-curvature alignment (0 = smoothest field only,
     /// 1 = default). Makes edge loops wrap around limbs and tubes.
     pub curvature_alignment: f64,
+    /// Curvature-adaptive density (0 = uniform quads, 1 = strongest): flat
+    /// regions get larger faces, tight features (fingers, ears, joints)
+    /// smaller ones, at the same total face budget.
+    pub adaptivity: f64,
 }
 
 /// Mirror-symmetry request. Planes pass through the surface's
@@ -102,6 +106,7 @@ impl Default for RemeshOptions {
             max_working_vertices: 4_000_000,
             symmetry: Symmetry::None,
             curvature_alignment: 1.0,
+            adaptivity: 0.6,
         }
     }
 }
@@ -396,23 +401,47 @@ fn field_aligned(
     let mirror = mirror_plane(&base, options.symmetry);
     let before = verts.len();
     let avg = subdivide::average_edge_length(&verts, &tris);
+    let adaptivity = if options.adaptivity.is_finite() {
+        options.adaptivity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let use_curvature = options.curvature_alignment > 0.0;
+    let mut tensors = (use_curvature || adaptivity > 0.0)
+        .then(|| guidance::curvature_tensors(&base, guidance::smoothing_for(&base, scale)));
+    // per-vertex target edge length (uniform when adaptivity is 0)
+    let mut sizes = match &tensors {
+        Some(t) if adaptivity > 0.0 => {
+            guidance::adaptive_scales(&base, t, target as f64, adaptivity)
+        }
+        _ => vec![scale; verts.len()],
+    };
+    let mut limits: Vec<f64> = sizes.iter().map(|h| (h * 0.5).min(avg * 2.0)).collect();
     let mut parents = Vec::new();
-    subdivide::subdivide_long_edges_with_parents(
+    subdivide::subdivide_adaptive(
         &mut verts,
         &mut tris,
-        (scale * 0.5).min(avg * 2.0),
+        &mut limits,
         options.max_working_vertices,
         &mut parents,
     )
     .ok_or(RetopoError::TooDense {
         limit: options.max_working_vertices,
     })?;
+    drop(limits);
+    // carry the coarse estimates onto refinement vertices (edge midpoints)
+    for &[a, b] in &parents {
+        sizes.push(0.5 * (sizes[a as usize] + sizes[b as usize]));
+        if let Some(t) = tensors.as_mut() {
+            let m = (t[a as usize] + t[b as usize]) * 0.5;
+            t.push(m);
+        }
+    }
     let subdivision_vertices_added = (verts.len() - before) as u64;
     report(&mut progress, 0.30)?;
 
     // ---- fields ----------------------------------------------------------
-    let curvature = (options.curvature_alignment > 0.0)
-        .then(|| guidance::tensors_through_refinement(&base, &parents, scale));
+    let curvature = if use_curvature { tensors } else { None };
     drop(base);
     let fopts = field::FieldOptions {
         curvature_weight: options.curvature_alignment.max(0.0),
@@ -430,16 +459,16 @@ fn field_aligned(
     let mut attempt_error = None;
     let mut solved = None;
     for (attempt, m) in SCALE_STEPS.iter().enumerate() {
-        let t = ((target as f64) / (m * m)).round().max(1.0) as u32;
-        let pf = field::solve_position(&verts, &tris, &orient, t, &fopts)?;
+        let scaled: Vec<f64> = sizes.iter().map(|h| h * m).collect();
+        let pf = field::solve_position_adaptive(&verts, &tris, &orient, &scaled, &fopts)?;
         report(&mut progress, 0.80)?; // also lets the host cancel between retries
-        match extract::extract_mesh(
+        match extract::extract_mesh_adaptive(
             &verts,
             &tris,
             &orient.directions,
             &orient.normals,
             &pf.anchors,
-            pf.scale,
+            &pf.scales,
         ) {
             Ok(mesh) => {
                 solved = Some((pf, mesh, attempt as u32 + 1));

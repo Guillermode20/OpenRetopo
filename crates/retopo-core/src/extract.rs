@@ -196,21 +196,21 @@ fn compat_position_extrinsic_index_4(
     n1: Vector3<f64>,
     q1: Vector3<f64>,
     o1: Vector3<f64>,
-    scale: f64,
-    inv_scale: f64,
+    s0: f64,
+    s1: f64,
 ) -> ([i64; 2], [i64; 2], f64) {
     let (t0, t1) = (n0.cross(&q0), n1.cross(&q1));
     let middle = middle_point(p0, n0, p1, n1);
-    let o0p = position_floor_index_4(o0, q0, n0, middle, inv_scale);
-    let o1p = position_floor_index_4(o1, q1, n1, middle, inv_scale);
+    let o0p = position_floor_index_4(o0, q0, n0, middle, 1.0 / s0);
+    let o1p = position_floor_index_4(o1, q1, n1, middle, 1.0 / s1);
     let corner = |k: usize| [(k & 1) as i64, ((k & 2) >> 1) as i64];
     let mut best = (f64::INFINITY, 0usize, 0usize);
     for i in 0..4 {
         let ci = corner(i);
-        let o0t = o0 + (q0 * (ci[0] + o0p[0]) as f64 + t0 * (ci[1] + o0p[1]) as f64) * scale;
+        let o0t = o0 + (q0 * (ci[0] + o0p[0]) as f64 + t0 * (ci[1] + o0p[1]) as f64) * s0;
         for j in 0..4 {
             let cj = corner(j);
-            let o1t = o1 + (q1 * (cj[0] + o1p[0]) as f64 + t1 * (cj[1] + o1p[1]) as f64) * scale;
+            let o1t = o1 + (q1 * (cj[0] + o1p[0]) as f64 + t1 * (cj[1] + o1p[1]) as f64) * s1;
             let cost = (o0t - o1t).norm_squared();
             if cost < best.0 {
                 best = (cost, i, j);
@@ -383,7 +383,27 @@ pub fn extract_mesh(
         directions,
         normals,
         anchors,
-        scale,
+        &vec![scale; positions.len()],
+        &ExtractOptions::default(),
+    )
+}
+
+/// [`extract_mesh`] with a per-vertex target edge length (density field).
+pub fn extract_mesh_adaptive(
+    positions: &[[f64; 3]],
+    tris: &[[u32; 3]],
+    directions: &[Vector3<f64>],
+    normals: &[Vector3<f64>],
+    anchors: &[Vector3<f64>],
+    scales: &[f64],
+) -> Result<ExtractedMesh, RetopoError> {
+    extract_mesh_with(
+        positions,
+        tris,
+        directions,
+        normals,
+        anchors,
+        scales,
         &ExtractOptions::default(),
     )
 }
@@ -397,12 +417,14 @@ pub fn extract_mesh_with(
     directions: &[Vector3<f64>],
     normals: &[Vector3<f64>],
     anchors: &[Vector3<f64>],
-    scale: f64,
+    scales: &[f64],
     options: &ExtractOptions,
 ) -> Result<ExtractedMesh, RetopoError> {
     check_closed_manifold(tris)?;
     let n = positions.len();
-    let inv_scale = 1.0 / scale;
+    if scales.len() != n || scales.iter().any(|s| !(s.is_finite() && *s > 0.0)) {
+        return Err(RetopoError::FieldDiverged);
+    }
     let mut stats = ExtractionStats {
         euler_input: crate::field::euler_characteristic(n, tris),
         ..ExtractionStats::default()
@@ -433,8 +455,8 @@ pub fn extract_mesh_with(
                 normals[j],
                 qj,
                 anchors[j],
-                scale,
-                inv_scale,
+                scales[i],
+                scales[j],
             );
             let (du, dv) = ((si[0] - sj[0]).abs(), (si[1] - sj[1]).abs());
             if du.max(dv) > 1 || (du == 1 && dv == 1) {
@@ -523,16 +545,26 @@ pub fn extract_mesh_with(
     let mut o_new = vec![Vector3::zeros(); out_count];
     let mut n_new = vec![Vector3::zeros(); out_count];
     let mut w_acc = vec![0.0f64; out_count];
+    let mut s_acc = vec![0.0f64; out_count];
+    let mut s_cnt = vec![0.0f64; out_count];
     for j in 0..n {
         let Some(&oi) = vertex_map.get(&dset.find(j as u32)) else {
             continue;
         };
         let d = anchors[j] - Vector3::from(positions[j]);
-        let w = (-9.0 * d.norm_squared() * inv_scale * inv_scale).exp();
+        let w = (-9.0 * d.norm_squared() / (scales[j] * scales[j])).exp();
         o_new[oi as usize] += anchors[j] * w;
         n_new[oi as usize] += normals[j] * w;
         w_acc[oi as usize] += w;
+        s_acc[oi as usize] += scales[j];
+        s_cnt[oi as usize] += 1.0;
     }
+    // local target edge length of each output vertex (mean over its cluster)
+    let mut s_new: Vec<f64> = s_acc
+        .iter()
+        .zip(&s_cnt)
+        .map(|(a, c)| a / c.max(1.0))
+        .collect();
     for i in 0..out_count {
         if w_acc[i] > 0.0 && (n_new[i].norm() > 1e-30) {
             o_new[i] /= w_acc[i];
@@ -561,7 +593,7 @@ pub fn extract_mesh_with(
 
     // ---- Step 5: snapping and removing unnecessary edges ------------------
     if options.remove_unnecessary_edges {
-        snap_and_clean(&mut out_adj, &mut o_new, &mut n_new, scale, &mut stats);
+        snap_and_clean(&mut out_adj, &mut o_new, &mut n_new, &mut s_new, &mut stats);
     }
 
     // ---- Step 6: orient edges (clockwise around the normal) ---------------
@@ -649,10 +681,11 @@ fn snap_and_clean(
     adj: &mut [Vec<u32>],
     o: &mut [Vector3<f64>],
     nrm: &mut [Vector3<f64>],
-    scale: f64,
+    scales: &mut [f64],
     stats: &mut ExtractionStats,
 ) {
-    let thresh = 0.3 * scale;
+    // per-vertex threshold (0.3 of the local target edge length)
+    let thresh_of = |scales: &[f64], v: u32| 0.3 * scales[v as usize];
     let height = |a: f64, b: f64, c: f64| {
         let s = 0.5 * (a + b + c);
         let area2 = (s * (s - a) * (s - b) * (s - c)).max(0.0);
@@ -679,7 +712,7 @@ fn snap_and_clean(
                             ((p_j - p_k).norm(), (p_i - p_j).norm(), (p_i - p_k).norm());
                         if a > b.max(c) {
                             let h = height(a, b, c);
-                            if h < thresh {
+                            if h < thresh_of(scales, i) {
                                 candidates.push((h, i, j, k));
                             }
                         }
@@ -697,9 +730,11 @@ fn snap_and_clean(
                 if height(a, b, c) != h0 {
                     continue;
                 }
+                let thresh = thresh_of(scales, i);
                 if b < thresh || c < thresh {
                     let m = if b < thresh { j } else { k };
                     o[i as usize] = (p_i + o[m as usize]) * 0.5;
+                    scales[i as usize] = 0.5 * (scales[i as usize] + scales[m as usize]);
                     nrm[i as usize] = (nrm[i as usize] + nrm[m as usize]).normalize();
                     let m_list = std::mem::take(&mut adj[m as usize]);
                     for &x in &m_list {
@@ -1105,7 +1140,7 @@ mod tests {
             &orient.directions,
             &orient.normals,
             &pf.anchors,
-            pf.scale,
+            &pf.scales,
             eo,
         )
     }
