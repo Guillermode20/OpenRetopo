@@ -64,6 +64,31 @@ reset_scene()
 bpy.ops.mesh.primitive_cube_add(size=2.0)
 export("Cube", os.path.join(OUT, "cube.obj"))
 
+# 6) Cylinder — developable surface: lattice consistency must be achievable
+reset_scene()
+bpy.ops.mesh.primitive_cylinder_add(vertices=48, radius=1.0, depth=2.0, end_fill_type="NGON")
+export("Cylinder", os.path.join(OUT, "cylinder.obj"))
+
+# 7) Displaced sphere — closed, organic, sculpt-like irregular surface.
+#    Deterministic: procedural Clouds texture (no RNG), fixed parameters.
+reset_scene()
+bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=1.0)
+obj = bpy.context.active_object
+sub = obj.modifiers.new("Subdiv", "SUBSURF")
+sub.levels = 1
+sub.render_levels = 1
+tex = bpy.data.textures.new("FixtureNoise", type="CLOUDS")
+tex.noise_scale = 0.45
+tex.noise_depth = 2
+tex.noise_basis = "BLENDER_ORIGINAL"
+disp = obj.modifiers.new("Displace", "DISPLACE")
+disp.texture = tex
+disp.texture_coords = "LOCAL"
+disp.strength = 0.25
+disp.mid_level = 0.5
+export(obj.name, os.path.join(OUT, "displaced_sphere.obj"))
+bpy.data.textures.remove(tex)
+
 print("[fixtures] exported to", OUT)
 for f in sorted(os.listdir(OUT)):
     print(" ", f)

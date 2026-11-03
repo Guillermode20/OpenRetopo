@@ -77,15 +77,22 @@ pub struct FieldOptions {
     pub convergence_degrees: f64,
     /// rotational symmetry: 4 for quad-dominant output.
     pub rosy: u32,
+    /// Solve the position field coarse-to-fine on the same hierarchy as the
+    /// orientation field (reference behaviour).
+    pub hierarchical_positions: bool,
 }
 
 impl Default for FieldOptions {
     fn default() -> Self {
         FieldOptions {
-            max_iterations: 250,
-            iterations_per_level: 25,
+            // Few sweeps: the lattice dynamics are weakly unstable around
+            // frustrated singular regions and *diverge* with more passes.
+            // The coarse->fine hierarchy supplies the global alignment.
+            max_iterations: 6,
+            iterations_per_level: 6,
             convergence_degrees: 0.1,
             rosy: 4,
+            hierarchical_positions: true,
         }
     }
 }
@@ -114,7 +121,7 @@ fn rotate_into_plane(
 /// Compatibility pair for intrinsic 4-RoSy averaging (eq. from the paper's
 /// reference implementation): returns `(q0, q1_snapped)` where `q1` is moved
 /// into plane `n0` and snapped to the closest 90° symmetry position of `q0`.
-fn compat_orientation_intrinsic_4(
+pub(crate) fn compat_orientation_intrinsic_4(
     q0: Vector3<f64>,
     n0: Vector3<f64>,
     q1_raw: Vector3<f64>,
@@ -200,6 +207,35 @@ fn project_unit(q: Vector3<f64>, n: Vector3<f64>) -> Vector3<f64> {
     projected.normalize()
 }
 
+/// Greedy deterministic graph coloring: same-colored vertices never share
+/// an edge. Colored sweeps break the pathological lockstep oscillation of
+/// plain Gauss-Seidel on highly symmetric graphs (the reference uses the
+/// same partitioning for its parallel updates).
+fn color_graph(adj: &[Vec<(u32, f64)>]) -> Vec<Vec<usize>> {
+    let n = adj.len();
+    let mut colors = vec![usize::MAX; n];
+    let mut phases: Vec<Vec<usize>> = Vec::new();
+    for i in 0..n {
+        let mut used = std::collections::HashSet::new();
+        for &(j, _) in &adj[i] {
+            let c = colors[j as usize];
+            if c != usize::MAX {
+                used.insert(c);
+            }
+        }
+        let mut c = 0;
+        while used.contains(&c) {
+            c += 1;
+        }
+        colors[i] = c;
+        if phases.len() <= c {
+            phases.resize(c + 1, Vec::new());
+        }
+        phases[c].push(i);
+    }
+    phases
+}
+
 /// One full optimization pass over a level until convergence or the
 /// iteration cap. Returns the number of iterations performed.
 fn solve_level(
@@ -208,37 +244,40 @@ fn solve_level(
     max_iterations: u32,
     convergence_degrees: f64,
 ) -> Result<u32, crate::RetopoError> {
+    let phases = color_graph(&level.adj);
     let mut iteration = 0u32;
     loop {
         iteration += 1;
         let mut max_step = 0.0f64;
-        for i in 0..level.positions.len() {
-            let n_i = level.normals[i];
-            if level.adj[i].is_empty() {
-                continue;
-            }
-            let mut sum = dirs[i];
-            let mut weight_sum = 0.0f64;
-            for &(j, w) in &level.adj[i] {
-                let q_j = dirs[j as usize];
-                let (v0, v1) =
-                    compat_orientation_intrinsic_4(sum, n_i, q_j, level.normals[j as usize]);
-                sum = v0 * weight_sum + v1 * w;
-                sum -= n_i * n_i.dot(&sum);
-                weight_sum += w;
-                let norm = sum.norm();
-                if norm > 1e-12 {
-                    sum /= norm;
+        for phase in &phases {
+            for &i in phase {
+                let n_i = level.normals[i];
+                if level.adj[i].is_empty() {
+                    continue;
                 }
-            }
-            if weight_sum > 0.0 {
-                let change = fold_quarter_turns(dirs[i].angle(&sum).to_degrees());
-                max_step = if change.is_finite() {
-                    max_step.max(change)
-                } else {
-                    f64::INFINITY
-                };
-                dirs[i] = sum;
+                let mut sum = dirs[i];
+                let mut weight_sum = 0.0f64;
+                for &(j, w) in &level.adj[i] {
+                    let q_j = dirs[j as usize];
+                    let (v0, v1) =
+                        compat_orientation_intrinsic_4(sum, n_i, q_j, level.normals[j as usize]);
+                    sum = v0 * weight_sum + v1 * w;
+                    sum -= n_i * n_i.dot(&sum);
+                    weight_sum += w;
+                    let norm = sum.norm();
+                    if norm > 1e-12 {
+                        sum /= norm;
+                    }
+                }
+                if weight_sum > 0.0 {
+                    let change = fold_quarter_turns(dirs[i].angle(&sum).to_degrees());
+                    max_step = if change.is_finite() {
+                        max_step.max(change)
+                    } else {
+                        f64::INFINITY
+                    };
+                    dirs[i] = sum;
+                }
             }
         }
         if !max_step.is_finite() {
@@ -771,7 +810,7 @@ pub fn surface_area(positions: &[[f64; 3]], tris: &[[u32; 3]]) -> f64 {
 
 /// Point on both tangent planes closest to the midpoint between the two
 /// surface points — the pivot for the minimal arc rotating frame planes.
-fn middle_point(
+pub(crate) fn middle_point(
     p0: Vector3<f64>,
     n0: Vector3<f64>,
     p1: Vector3<f64>,
@@ -791,7 +830,7 @@ fn middle_point(
 
 /// Snap `p` onto the lattice defined by frame `(o, q, n)` with `scale`
 /// spacing, returning the snapped lattice point.
-fn position_round_4(
+pub(crate) fn position_round_4(
     o: Vector3<f64>,
     q: Vector3<f64>,
     n: Vector3<f64>,
@@ -813,21 +852,20 @@ struct FrameProbe {
     o: Vector3<f64>,
 }
 
-/// Compatibility pair for intrinsic position averaging: rotate the
-/// neighbour frame into plane `f0.n` and snap onto the lattice relative to
-/// the current anchor `f0.o`.
-fn compat_position_intrinsic_4(
-    f0: FrameProbe,
-    f1: FrameProbe,
-    scale: f64,
-    inv_scale: f64,
+/// Rotate the neighbor's position frame into the plane of `(p0, n0)` using
+/// the minimal arc, including the antiparallel-normal fix. Returns the
+/// rotated `(q, o)`.
+pub(crate) fn rotate_frame_into_plane(
+    o1: Vector3<f64>,
+    q1: Vector3<f64>,
+    p0: Vector3<f64>,
+    n0: Vector3<f64>,
+    p1: Vector3<f64>,
+    n1: Vector3<f64>,
 ) -> (Vector3<f64>, Vector3<f64>) {
-    let (p0, n0, o0) = (f0.p, f0.n, f0.o);
-    let (p1, n1) = (f1.p, f1.n);
     let cos_theta = n1.dot(&n0);
-    let mut q1 = f1.q;
-    let mut o1 = f1.o;
-
+    let mut q1 = q1;
+    let mut o1 = o1;
     if cos_theta < 0.9999 {
         let axis = n1.cross(&n0);
         let axis_len_sq = axis.dot(&axis);
@@ -853,7 +891,21 @@ fn compat_position_intrinsic_4(
         }
         // else: nearly identical normals — nothing to rotate
     }
+    (q1, o1)
+}
 
+/// Compatibility pair for intrinsic position averaging: rotate the
+/// neighbour frame into plane `f0.n` and snap onto the lattice relative to
+/// the current anchor `f0.o`.
+fn compat_position_intrinsic_4(
+    f0: FrameProbe,
+    f1: FrameProbe,
+    scale: f64,
+    inv_scale: f64,
+) -> (Vector3<f64>, Vector3<f64>) {
+    let (p0, n0, o0) = (f0.p, f0.n, f0.o);
+    let (p1, n1) = (f1.p, f1.n);
+    let (q1, o1) = rotate_frame_into_plane(f1.o, f1.q, p0, n0, p1, n1);
     (o0, position_round_4(o1, q1, n0, o0, scale, inv_scale))
 }
 
@@ -898,88 +950,109 @@ pub fn solve_position(
     let scale = (area / target).sqrt();
     let inv_scale = 1.0 / scale;
 
-    let hierarchy = Hierarchy::build(positions, tris, 25);
-    let n_levels = hierarchy.levels.len();
-    let mut anchors: Vec<Vec<Vector3<f64>>> = Vec::with_capacity(n_levels);
-    anchors.resize(n_levels, Vec::new());
+    if options.hierarchical_positions {
+        let o = solve_position_hierarchical(positions, tris, orientation, scale, options)?;
+        return Ok(PositionField { anchors: o, scale });
+    }
+    let level = hierarchy::level_from_mesh(positions, tris);
+    let mut o: Vec<Vector3<f64>> = (0..level.positions.len())
+        .map(|i| position_hash(level.positions[i], level.normals[i], scale))
+        .collect();
+    solve_position_level(
+        &level,
+        &orientation.directions,
+        &mut o,
+        scale,
+        inv_scale,
+        options.max_iterations,
+        options.convergence_degrees,
+    )?;
 
+    Ok(PositionField { anchors: o, scale })
+}
+
+/// Restrict the fine orientation field down the hierarchy: each coarse node
+/// takes the symmetry-aligned sum of its (up to two) children, projected
+/// onto its own tangent plane. Coarse position solves must use frames that
+/// agree with the fine field, otherwise their anchors are meaningless as an
+/// initialization for the finer level.
+fn restrict_orientation(hier: &Hierarchy, fine: &[Vector3<f64>]) -> Vec<Vec<Vector3<f64>>> {
+    let mut out: Vec<Vec<Vector3<f64>>> = vec![fine.to_vec()];
+    for l in 0..hier.levels.len() - 1 {
+        let lv = &hier.levels[l];
+        let next = &hier.levels[l + 1];
+        let src = &out[l];
+        let mut q_next = Vec::with_capacity(next.positions.len());
+        for (i, &[a, b]) in hier.to_upper[l].iter().enumerate() {
+            let q0 = src[a as usize];
+            let mut q = q0;
+            if b != hierarchy::INVALID {
+                let (v0, v1) = compat_orientation_intrinsic_4(
+                    q0,
+                    lv.normals[a as usize],
+                    src[b as usize],
+                    lv.normals[b as usize],
+                );
+                q = v0 + v1;
+            }
+            q_next.push(project_unit(q, next.normals[i]));
+        }
+        out.push(q_next);
+    }
+    out
+}
+
+/// Coarse-to-fine position solve (reference behaviour): hash-initialise the
+/// coarsest level, solve a few sweeps per level, project anchors onto each
+/// child's tangent plane, repeat down to the input mesh.
+fn solve_position_hierarchical(
+    positions: &[[f64; 3]],
+    tris: &[[u32; 3]],
+    orientation: &OrientationField,
+    scale: f64,
+    options: &FieldOptions,
+) -> Result<Vec<Vector3<f64>>, crate::RetopoError> {
+    let inv_scale = 1.0 / scale;
+    let hier = Hierarchy::build(positions, tris, 25);
+    let q = restrict_orientation(&hier, &orientation.directions);
+    let n_levels = hier.levels.len();
+    let mut o: Vec<Vector3<f64>> = Vec::new();
     for level in (0..n_levels).rev() {
-        let lv = &hierarchy.levels[level];
-        let mut o: Vec<Vector3<f64>> = if level == n_levels - 1 {
-            (0..lv.positions.len())
+        let lv = &hier.levels[level];
+        if level == n_levels - 1 {
+            o = (0..lv.positions.len())
                 .map(|i| position_hash(lv.positions[i], lv.normals[i], scale))
-                .collect()
+                .collect();
         } else {
-            // project the parent's anchor onto the child's tangent plane
-            // through the child's surface point: o -= n*n.dot(o - v)
             let mut init = vec![Vector3::zeros(); lv.positions.len()];
-            let up = &hierarchy.to_upper[level];
-            let parent = &anchors[level + 1];
-            for (j, &[a, b]) in up.iter().enumerate() {
-                for &dest in [a, b].iter() {
+            for (j, &[a, b]) in hier.to_upper[level].iter().enumerate() {
+                for dest in [a, b] {
                     if dest == hierarchy::INVALID {
                         continue;
                     }
-                    let child_pos = Vector3::from(lv.positions[dest as usize]);
-                    let n_child = lv.normals[dest as usize];
-                    let o = parent[j] - n_child * n_child.dot(&(parent[j] - child_pos));
-                    init[dest as usize] = o;
+                    let v = Vector3::from(lv.positions[dest as usize]);
+                    let n = lv.normals[dest as usize];
+                    init[dest as usize] = o[j] - n * n.dot(&(o[j] - v));
                 }
             }
-            init
-        };
-
-        let q_dirs: Vec<Vector3<f64>> = if level == 0 {
-            orientation.directions.clone()
-        } else {
-            // coarse levels: re-derive directions with the orientation solver
-            // on that level's graph rather than interpolating level 0's
-            let (sub_field, _) = solve_orientation_for_level(lv, options)?;
-            sub_field
-        };
-
-        let max_iter = if level == 0 {
+            o = init;
+        }
+        let iters = if level == 0 {
             options.max_iterations
         } else {
             options.iterations_per_level
         };
         solve_position_level(
             lv,
-            &q_dirs,
+            &q[level],
             &mut o,
             scale,
             inv_scale,
-            max_iter,
+            iters,
             options.convergence_degrees,
         )?;
-        anchors[level] = o;
     }
-
-    Ok(PositionField {
-        anchors: anchors
-            .into_iter()
-            .next()
-            .expect("at least one hierarchy level"),
-        scale,
-    })
-}
-
-/// Solve the orientation field on an arbitrary hierarchy level (used for
-/// coarse position solves so each level has its own consistent field).
-fn solve_orientation_for_level(
-    level: &HierarchyLevel,
-    options: &FieldOptions,
-) -> Result<(Vec<Vector3<f64>>, u32), crate::RetopoError> {
-    let mut dirs: Vec<Vector3<f64>> = (0..level.positions.len())
-        .map(|i| initial_direction(level.positions[i], level.normals[i]))
-        .collect();
-    let iters = solve_level(
-        level,
-        &mut dirs,
-        options.iterations_per_level,
-        options.convergence_degrees,
-    )?;
-    Ok((dirs, iters))
+    Ok(o)
 }
 
 /// One level of the position solve.
@@ -992,54 +1065,61 @@ fn solve_position_level(
     max_iterations: u32,
     convergence_degrees: f64,
 ) -> Result<u32, crate::RetopoError> {
+    let phases = color_graph(&level.adj);
     let convergence_dist = scale * (convergence_degrees.to_radians()).tan();
     let mut iteration = 0u32;
     loop {
         iteration += 1;
         let mut max_step = 0.0f64;
-        for i in 0..level.positions.len() {
-            if level.adj[i].is_empty() {
-                continue;
-            }
-            let n_i = level.normals[i];
-            let v_i = Vector3::from(level.positions[i]);
-            let q_i = q_dirs[i];
-            let mut sum = anchors[i];
-            let mut weight_sum = 0.0f64;
-            for &(j, w) in &level.adj[i] {
-                let q_j = q_dirs[j as usize];
-                let o_j = anchors[j as usize];
-                let p_j = Vector3::from(level.positions[j as usize]);
-                let (v0, v1) = compat_position_intrinsic_4(
-                    FrameProbe {
-                        p: v_i,
-                        n: n_i,
-                        q: q_i,
-                        o: sum,
-                    },
-                    FrameProbe {
-                        p: p_j,
-                        n: level.normals[j as usize],
-                        q: q_j,
-                        o: o_j,
-                    },
-                    scale,
-                    inv_scale,
-                );
-                sum = v0 * weight_sum + v1 * w;
-                weight_sum += w;
-                if weight_sum > 1e-12 {
-                    sum /= weight_sum;
+        for phase in &phases {
+            for &i in phase {
+                if level.adj[i].is_empty() {
+                    continue;
                 }
-                sum -= n_i * n_i.dot(&(sum - v_i));
+                let n_i = level.normals[i];
+                let v_i = Vector3::from(level.positions[i]);
+                let q_i = q_dirs[i];
+                let mut sum = anchors[i];
+                let mut weight_sum = 0.0f64;
+                for &(j, w) in &level.adj[i] {
+                    let q_j = q_dirs[j as usize];
+                    let o_j = anchors[j as usize];
+                    let p_j = Vector3::from(level.positions[j as usize]);
+                    let (v0, v1) = compat_position_intrinsic_4(
+                        FrameProbe {
+                            p: v_i,
+                            n: n_i,
+                            q: q_i,
+                            o: sum,
+                        },
+                        FrameProbe {
+                            p: p_j,
+                            n: level.normals[j as usize],
+                            q: q_j,
+                            o: o_j,
+                        },
+                        scale,
+                        inv_scale,
+                    );
+                    sum = v0 * weight_sum + v1 * w;
+                    weight_sum += w;
+                    if weight_sum > 1e-12 {
+                        sum /= weight_sum;
+                    }
+                    sum -= n_i * n_i.dot(&(sum - v_i));
+                }
+                // Re-anchor: pick the lattice point (with origin `sum`) closest
+                // to the vertex itself. Without this the anchor drifts freely
+                // along the lattice and every extra sweep diffuses the field.
+                let sum = position_round_4(sum, q_i, n_i, v_i, scale, inv_scale);
+                let step = (anchors[i] - sum).norm();
+                max_step = if step.is_finite() {
+                    max_step.max(step)
+                } else {
+                    f64::INFINITY
+                };
+                anchors[i] = sum;
             }
-            let step = (anchors[i] - sum).norm();
-            max_step = if step.is_finite() {
-                max_step.max(step)
-            } else {
-                f64::INFINITY
-            };
-            anchors[i] = sum;
         }
         if !max_step.is_finite() {
             return Err(crate::RetopoError::FieldDiverged);
@@ -1138,14 +1218,16 @@ mod position_tests {
 }
 
 #[cfg(test)]
-mod position_debug {
+#[allow(clippy::needless_range_loop)] // temporary diagnostics
+mod position_convergence {
     use super::*;
     use crate::obj;
     use std::path::PathBuf;
 
     #[test]
-    fn cube_position_trace() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cube.obj");
+    fn icosphere_convergence_trace() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/icosphere.obj");
         let mesh = obj::load(&path).unwrap();
         let positions: Vec<[f64; 3]> = mesh
             .positions
@@ -1153,52 +1235,234 @@ mod position_debug {
             .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
             .collect();
         let tris = mesh.triangles;
-        let (orient, _) = solve_orientation(&positions, &tris, &FieldOptions::default()).unwrap();
-        let area = surface_area(&positions, &tris);
-        let scale = (area / 2000.0f64).sqrt();
-        let _ = scale;
-        let hier = Hierarchy::build(&positions, &tris, 25);
-        let n_levels = hier.levels.len();
-        let mut anchors: Vec<Vec<Vector3<f64>>> = Vec::with_capacity(n_levels);
-        anchors.resize(n_levels, Vec::new());
-        for level in (0..n_levels).rev() {
-            let lv = &hier.levels[level];
-            let mut o: Vec<Vector3<f64>> = if level == n_levels - 1 {
-                (0..lv.positions.len())
-                    .map(|i| position_hash(lv.positions[i], lv.normals[i], 0.1))
-                    .collect()
-            } else {
-                let mut init = vec![Vector3::zeros(); lv.positions.len()];
-                let up = &hier.to_upper[level];
-                let parent = &anchors[level + 1];
-                for (j, &[a, b]) in up.iter().enumerate() {
-                    for &dest in [a, b].iter() {
-                        if dest == hierarchy::INVALID {
-                            continue;
+        let opts = FieldOptions::default();
+        let (orient, _) = solve_orientation(&positions, &tris, &opts).unwrap();
+        let pf = solve_position(
+            &positions,
+            &tris,
+            &orient,
+            320,
+            &FieldOptions {
+                max_iterations: 3000,
+                iterations_per_level: 10,
+                convergence_degrees: 0.0,
+                rosy: 4,
+                hierarchical_positions: true,
+            },
+        )
+        .unwrap();
+
+        // residual between adjacent anchors, in lattice cells
+        let adj = {
+            let mut a: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
+            let mut seen: Vec<std::collections::HashSet<u32>> = (0..positions.len())
+                .map(|_| std::collections::HashSet::new())
+                .collect();
+            for t in &tris {
+                for i in 0..3 {
+                    let v = t[i] as usize;
+                    for k in 1..3 {
+                        let n = t[(i + k) % 3];
+                        if seen[v].insert(n) {
+                            a[v].push(n);
                         }
-                        let child_pos = Vector3::from(lv.positions[dest as usize]);
-                        let n_child = lv.normals[dest as usize];
-                        let op = parent[j] - n_child * n_child.dot(&(parent[j] - child_pos));
-                        init[dest as usize] = op;
                     }
                 }
-                init
-            };
-            let (q_dirs, _) = if level == 0 {
-                (orient.directions.clone(), 0)
-            } else {
-                solve_orientation_for_level(lv, &FieldOptions::default()).unwrap()
-            };
-            println!("level {level} anchors pre-solve: {:?}", o);
-            println!("level {level} q_dirs: {:?}", q_dirs);
-            println!("level {level} adj: {:?}", lv.adj);
-            let sc = (area / 2000.0f64).sqrt();
-            let iters = solve_position_level(lv, &q_dirs, &mut o, sc, 1.0 / sc, 25, 0.1).unwrap();
-            let max_o = o.iter().map(|a| a.norm()).fold(0.0f64, f64::max);
-            let min_o = o.iter().map(|a| a.norm()).fold(f64::INFINITY, f64::min);
-            let nonfinite = o.iter().filter(|a| !a.norm().is_finite()).count();
-            println!("level {level}: nodes={} iters={iters} max|o|={max_o:.3} min|o|={min_o:.3} nonfinite={nonfinite}", lv.positions.len());
-            anchors[level] = o;
+            }
+            a
+        };
+        let inv_scale = 1.0 / pf.scale;
+        let mut count = 0u64;
+        let mut within_one_cell = 0u64;
+        let mut total_dev = 0.0;
+        for i in 0..positions.len() {
+            let n_i = orient.normals[i];
+            let u = orient.directions[i].normalize();
+            let v = n_i.cross(&u);
+            for &j in &adj[i] {
+                if (j as usize) <= i {
+                    continue;
+                }
+                let d = pf.anchors[i] - pf.anchors[j as usize];
+                // project onto the lattice axes of node i
+                let du = (d.dot(&u) * inv_scale).round();
+                let dv = (d.dot(&v) * inv_scale).round();
+                let on_lattice = u * du * pf.scale + v * dv * pf.scale + n_i * n_i.dot(&d);
+                let dev = (d - on_lattice).norm();
+                total_dev += dev;
+                if dev < 0.25 * pf.scale {
+                    within_one_cell += 1;
+                }
+                count += 1;
+            }
+        }
+        println!("edges={count} within_quarter_cell={within_one_cell} ({:.1}%) mean_dev={:.4} scale={:.4}",
+                 100.0 * within_one_cell as f64 / count as f64, total_dev / count as f64, pf.scale);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::needless_range_loop)] // temporary diagnostics
+mod position_lattice_sweep {
+    use super::*;
+    use crate::obj;
+    use std::path::PathBuf;
+
+    fn lattice_consistency(name: &str, target_faces: u32) -> (f64, f64, f64) {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name);
+        let mesh = obj::load(&path).unwrap();
+        let positions: Vec<[f64; 3]> = mesh
+            .positions
+            .iter()
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .collect();
+        let tris = mesh.triangles;
+        let opts = FieldOptions::default();
+        let (orient, _) = solve_orientation(&positions, &tris, &opts).unwrap();
+        let pf = solve_position(&positions, &tris, &orient, target_faces, &opts).unwrap();
+
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
+        let mut seen: Vec<std::collections::HashSet<u32>> = (0..positions.len())
+            .map(|_| std::collections::HashSet::new())
+            .collect();
+        for t in &tris {
+            for i in 0..3 {
+                let v = t[i] as usize;
+                for k in 1..3 {
+                    let n = t[(i + k) % 3];
+                    if seen[v].insert(n) {
+                        adj[v].push(n);
+                    }
+                }
+            }
+        }
+        let inv_scale = 1.0 / pf.scale;
+        let mut count = 0u64;
+        let mut within = 0u64;
+        let mut total_dev = 0.0f64;
+        for i in 0..positions.len() {
+            let n_i = orient.normals[i];
+            let u = orient.directions[i].normalize();
+            let v = n_i.cross(&u);
+            for &j in &adj[i] {
+                if (j as usize) <= i {
+                    continue;
+                }
+                let d = pf.anchors[i] - pf.anchors[j as usize];
+                let du = (d.dot(&u) * inv_scale).round();
+                let dv = (d.dot(&v) * inv_scale).round();
+                let on_lattice = u * du * pf.scale + v * dv * pf.scale + n_i * n_i.dot(&d);
+                let dev = (d - on_lattice).norm();
+                total_dev += dev;
+                if dev < 0.25 * pf.scale {
+                    within += 1;
+                }
+                count += 1;
+            }
+        }
+        (
+            100.0 * within as f64 / count as f64,
+            total_dev / count as f64,
+            pf.scale,
+        )
+    }
+
+    #[test]
+    fn sweep() {
+        for (name, target) in [
+            ("icosphere.obj", 80u32),
+            ("icosphere.obj", 160),
+            ("icosphere.obj", 320),
+            ("uv_sphere.obj", 300),
+            ("suzanne.obj", 500),
+        ] {
+            let (within, dev, scale) = lattice_consistency(name, target);
+            println!("{name}: consistent={within:.1}% mean_dev={dev:.4} scale={scale:.4}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::needless_range_loop)] // temporary diagnostics
+mod sweep_iters {
+    use super::*;
+    use crate::obj;
+    use std::path::PathBuf;
+
+    fn consistent(name: &str, target: u32, iters: u32, hier: bool) -> f64 {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name);
+        let mesh = obj::load(&path).unwrap();
+        let positions: Vec<[f64; 3]> = mesh
+            .positions
+            .iter()
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .collect();
+        let tris = mesh.triangles;
+        let opts = FieldOptions {
+            max_iterations: iters,
+            iterations_per_level: iters,
+            convergence_degrees: 0.0,
+            rosy: 4,
+            hierarchical_positions: hier,
+        };
+        let (orient, _) = solve_orientation(&positions, &tris, &FieldOptions::default()).unwrap();
+        let pf = solve_position(&positions, &tris, &orient, target, &opts).unwrap();
+
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); positions.len()];
+        let mut seen: Vec<std::collections::HashSet<u32>> = (0..positions.len())
+            .map(|_| std::collections::HashSet::new())
+            .collect();
+        for t in &tris {
+            for i in 0..3 {
+                let v = t[i] as usize;
+                for k in 1..3 {
+                    let n = t[(i + k) % 3];
+                    if seen[v].insert(n) {
+                        adj[v].push(n);
+                    }
+                }
+            }
+        }
+        let inv_scale = 1.0 / pf.scale;
+        let mut count = 0u64;
+        let mut within = 0u64;
+        for i in 0..positions.len() {
+            let n_i = orient.normals[i];
+            let u = orient.directions[i].normalize();
+            let v = n_i.cross(&u);
+            for &j in &adj[i] {
+                if (j as usize) <= i {
+                    continue;
+                }
+                let d = pf.anchors[i] - pf.anchors[j as usize];
+                let du = (d.dot(&u) * inv_scale).round();
+                let dv = (d.dot(&v) * inv_scale).round();
+                let on_lattice = u * du * pf.scale + v * dv * pf.scale + n_i * n_i.dot(&d);
+                if (d - on_lattice).norm() < 0.25 * pf.scale {
+                    within += 1;
+                }
+                count += 1;
+            }
+        }
+        100.0 * within as f64 / count as f64
+    }
+
+    #[test]
+    fn iters_sweep() {
+        for hier in [false, true] {
+            for iters in [2u32, 6, 12, 25, 100] {
+                println!(
+                    "hier={hier} iters={iters}: ico={:.1} uv={:.1} torus={:.1} suzanne={:.1}",
+                    consistent("icosphere.obj", 320, iters, hier),
+                    consistent("uv_sphere.obj", 300, iters, hier),
+                    consistent("torus.obj", 300, iters, hier),
+                    consistent("suzanne.obj", 500, iters, hier),
+                );
+            }
         }
     }
 }

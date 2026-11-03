@@ -101,7 +101,7 @@ fn vertex_normals(positions: &[[f64; 3]], tris: &[[u32; 3]]) -> Vec<Vector3<f64>
         .collect()
 }
 
-fn level_from_mesh(positions: &[[f64; 3]], tris: &[[u32; 3]]) -> HierarchyLevel {
+pub(crate) fn level_from_mesh(positions: &[[f64; 3]], tris: &[[u32; 3]]) -> HierarchyLevel {
     let adj = one_ring(positions.len(), tris)
         .into_iter()
         .map(|nbrs| nbrs.into_iter().map(|n| (n, 1.0)).collect())

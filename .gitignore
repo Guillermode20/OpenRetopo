@@ -7,3 +7,6 @@ __pycache__/
 open_retopo/native/*/*.so
 open_retopo/native/*/*.dll
 open_retopo/native/*/*.dylib
+# copied in at build time from the repo root
+open_retopo/LICENSE
+open_retopo/NOTICE.md

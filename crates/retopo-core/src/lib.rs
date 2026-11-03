@@ -7,8 +7,10 @@ use thiserror::Error;
 use crate::simplify::{simplify_to_target, SimplificationReport};
 use crate::weld::{weld_vertices, WeldReport};
 
+pub mod extract;
 mod hierarchy;
 mod simplify;
+pub mod subdivide;
 mod weld;
 
 pub mod field;
@@ -33,6 +35,12 @@ pub enum RetopoError {
     Cancelled,
     #[error("the orientation/position field solve diverged (non-finite values); the input may be degenerate or contain opposing face orientations")]
     FieldDiverged,
+    #[error("mesh has an open boundary; extraction currently supports closed meshes only")]
+    UnsupportedBoundary,
+    #[error("mesh contains non-manifold edges (more than two faces sharing an edge)")]
+    NonManifoldInput,
+    #[error("quad extraction produced an invalid mesh: {0}")]
+    ExtractionInvalid(String),
 }
 
 #[derive(Debug, Clone, Copy)]

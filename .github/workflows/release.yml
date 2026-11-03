@@ -76,6 +76,8 @@ jobs:
           echo "BLENDER_BIN=/tmp/blender/blender" >> "$GITHUB_ENV"
       - name: Validate and build multi-platform extension
         run: |
+          # license texts must ship inside the zip (GPL-3.0 + BSD-3 notice)
+          cp LICENSE NOTICE.md open_retopo/
           $BLENDER_BIN -b --factory-startup -noaudio --command extension validate open_retopo
           $BLENDER_BIN -b --factory-startup -noaudio --command extension build --source-dir open_retopo --output-dir dist
       - name: Generate checksums

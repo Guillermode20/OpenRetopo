@@ -20,3 +20,6 @@ esac
 mkdir -p "$dest"
 cp "$src" "$dest/"
 echo "copied $src -> $dest/"
+
+# License texts must ship inside the extension zip (GPL-3.0 + BSD-3 notice).
+cp LICENSE NOTICE.md open_retopo/
