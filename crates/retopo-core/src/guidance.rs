@@ -325,12 +325,15 @@ fn principal_curvatures(s: &Matrix3<f64>, n: Vector3<f64>) -> (f64, f64) {
 
 /// Spatially varying target edge length ("density field").
 ///
-/// Curved detail (ears, fingers, feet, faces, the creases at elbows and
-/// knees) gets smaller quads; broad, flat areas get larger ones. The raw
-/// size follows `(curvedness·s0 + u0)^-γ`, is clamped to
-/// `[s0/max_ratio, s0·max_ratio]`, diffused in log space (so it changes
-/// gradually — no abrupt seams), and renormalised so the expected face
-/// count `Σ area / h²` still matches `target_faces`.
+/// The size follows the local radius of curvature: `h ∝ (κ·s0 + u0)^-γ`
+/// with `κ = sqrt(k1² + k2²)`, so at `γ = 1` every limb gets about the same
+/// number of edges around it whatever its thickness — thin parts (ears,
+/// fingers, toes, joints' creases) get small quads, the torso big ones.
+/// Small sizes then spread outward under a gradient limit (a quad may be
+/// at most `1 + GRADE` times its neighbour), which keeps transitions
+/// graded without washing small features out as diffusion would. Finally
+/// the field is renormalised so `Σ area / h²` matches `target_faces`, with
+/// the ratio to the uniform size `s0` clamped to `1 + 3·adaptivity`.
 ///
 /// `adaptivity` ∈ [0, 1]: 0 = uniform (every value `s0`), 1 = strong.
 pub fn adaptive_scales(
@@ -346,9 +349,10 @@ pub fn adaptive_scales(
         return vec![s0; n];
     }
     let adaptivity = adaptivity.min(1.0);
-    let gamma = 0.75 * adaptivity;
-    let max_ratio = 1.0 + 2.0 * adaptivity; // up to 3x either way
-    const U0: f64 = 0.15;
+    let gamma = adaptivity;
+    let max_ratio = 1.0 + 3.0 * adaptivity;
+    const U0: f64 = 0.05;
+    const GRADE: f64 = 0.25;
     let mut log_h: Vec<f64> = (0..n)
         .map(|i| {
             let (ka, kb) = principal_curvatures(&tensors[i], level.normals[i]);
@@ -357,9 +361,8 @@ pub fn adaptive_scales(
             -gamma * (u + U0).ln()
         })
         .collect();
-    // gradual transitions: diffuse over a few edge lengths
-    let passes = (2 * smoothing_for(level, s0)).clamp(4, 60);
-    for _ in 0..passes {
+    // light denoising of the estimate
+    for _ in 0..2 {
         let prev = log_h.clone();
         for i in 0..n {
             let mut acc = prev[i] * level.areas[i];
@@ -373,20 +376,49 @@ pub fn adaptive_scales(
             }
         }
     }
-    // normalise to the face budget, clamping the ratio to s0
+    // normalise to the face budget, clamping the ratio to s0; the gradient
+    // limit runs inside the loop because it depends on absolute sizes
     let mut shift = 0.0;
     let (lo, hi) = ((s0 / max_ratio).ln(), (s0 * max_ratio).ln());
+    let mut out = vec![s0; n];
     for _ in 0..8 {
-        let faces: f64 = (0..n)
-            .map(|i| level.areas[i] / (2.0 * (log_h[i] + shift).clamp(lo, hi)).exp())
-            .sum();
+        for i in 0..n {
+            out[i] = (log_h[i] + shift).clamp(lo, hi).exp();
+        }
+        grade(level, &mut out, GRADE);
+        let faces: f64 = (0..n).map(|i| level.areas[i] / (out[i] * out[i])).sum();
         // faces ∝ h^-2  →  multiply h by sqrt(faces / target)
         shift += 0.5 * (faces / target_faces).ln();
     }
-    log_h
-        .iter()
-        .map(|&l| (l + shift).clamp(lo, hi).exp())
-        .collect()
+    for i in 0..n {
+        out[i] = (log_h[i] + shift).clamp(lo, hi).exp();
+    }
+    grade(level, &mut out, GRADE);
+    out
+}
+
+/// Limit how fast the size may grow: `h_j ≤ h_i + grade·|e_ij|` for every
+/// edge, propagated (Gauss–Seidel sweeps until stable, bounded).
+fn grade(level: &HierarchyLevel, h: &mut [f64], grade: f64) {
+    let n = h.len();
+    for _ in 0..n.min(500) {
+        let mut changed = false;
+        for i in 0..n {
+            let pi = Vector3::from(level.positions[i]);
+            for &(j, _) in &level.adj[i] {
+                let j = j as usize;
+                let e = (Vector3::from(level.positions[j]) - pi).norm();
+                let cap = h[i] + grade * e;
+                if h[j] > cap * (1.0 + 1e-9) {
+                    h[j] = cap;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Build per-level guidance for a hierarchy.
@@ -450,7 +482,7 @@ pub fn build_guides(
 }
 
 /// Weight of the "edges along the mirror plane" prior.
-const SEAM_WEIGHT: f64 = 0.5;
+const SEAM_WEIGHT: f64 = 2.0;
 
 /// A reflection maps a 4-RoSy cross onto itself both when it is aligned
 /// with the mirror plane and when it is at 45° to it, so mirror coupling

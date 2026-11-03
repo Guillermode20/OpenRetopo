@@ -1259,6 +1259,24 @@ fn solve_position_level(
                         sum -= n_i * n_i.dot(&(sum - v_i));
                     }
                 }
+                // Mirror seam: near the plane, slide the lattice origin along
+                // the plane-crossing direction onto the plane, so one lattice
+                // line (an edge loop) runs exactly along it. Without this the
+                // lattice may sit half a cell off and no half can be mirrored.
+                if let Some(plane) = guide.plane {
+                    let ax = plane.axis;
+                    if (v_i[ax] - plane.offset).abs() < s_i {
+                        let t_i = n_i.cross(&q_i);
+                        let c = if q_i[ax].abs() >= t_i[ax].abs() {
+                            q_i
+                        } else {
+                            t_i
+                        };
+                        if c[ax].abs() > 0.85 {
+                            sum += c * ((plane.offset - sum[ax]) / c[ax]);
+                        }
+                    }
+                }
                 // Re-anchor: pick the lattice point (with origin `sum`) closest
                 // to the vertex itself. Without this the anchor drifts freely
                 // along the lattice and every extra sweep diffuses the field.

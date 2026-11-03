@@ -7,11 +7,13 @@ use thiserror::Error;
 use crate::simplify::{simplify_to_target, SimplificationReport};
 use crate::weld::{weld_vertices, WeldReport};
 
+pub mod cleanup;
 pub mod extract;
 pub mod guidance;
 mod hierarchy;
 mod simplify;
 pub mod subdivide;
+pub mod symmetrize;
 mod weld;
 
 pub mod field;
@@ -455,9 +457,12 @@ fn field_aligned(
     // extraction are not. At some lattice phases extraction tunnels through
     // creases and the validator rejects the result (Euler/manifold check).
     // Retry a few nearby scales deterministically before failing loudly.
+    const RELAX_ITERATIONS: usize = 6;
     const SCALE_STEPS: [f64; 5] = [1.0, 0.95, 1.05, 0.9, 1.1];
     let mut attempt_error = None;
     let mut solved = None;
+    let mut fallback = None;
+    let mut mirror_image: Option<Vec<u32>> = None;
     for (attempt, m) in SCALE_STEPS.iter().enumerate() {
         let scaled: Vec<f64> = sizes.iter().map(|h| h * m).collect();
         let pf = field::solve_position_adaptive(&verts, &tris, &orient, &scaled, &fopts)?;
@@ -470,17 +475,73 @@ fn field_aligned(
             &pf.anchors,
             &pf.scales,
         ) {
-            Ok(mesh) => {
-                solved = Some((pf, mesh, attempt as u32 + 1));
-                break;
+            Ok(mut mesh) => {
+                cleanup::merge_triangles(&mesh.positions, &mut mesh.faces, None);
+                mesh.stats.quads = mesh.faces.iter().filter(|f| f.len() == 4).count() as u64;
+                mesh.stats.triangles = mesh.faces.iter().filter(|f| f.len() == 3).count() as u64;
+                let Some(plane) = mirror else {
+                    solved = Some((pf, mesh, attempt as u32 + 1));
+                    break;
+                };
+                // exact symmetry: mirror one half across the seam loop;
+                // otherwise keep the (nearly symmetric) mesh as a fallback
+                // and try the next scale for a clean seam
+                let poly = symmetrize::PolyMesh {
+                    positions: std::mem::take(&mut mesh.positions),
+                    faces: std::mem::take(&mut mesh.faces),
+                };
+                match symmetrize::symmetrize(&poly, plane, mesh.stats.euler_output) {
+                    Some(sym) => {
+                        mesh.positions = sym.mesh.positions;
+                        mesh.faces = sym.mesh.faces;
+                        mirror_image = Some(sym.image);
+                        mesh.stats.output_vertices = mesh.positions.len() as u64;
+                        mesh.stats.quads =
+                            mesh.faces.iter().filter(|f| f.len() == 4).count() as u64;
+                        mesh.stats.triangles =
+                            mesh.faces.iter().filter(|f| f.len() == 3).count() as u64;
+                        solved = Some((pf, mesh, attempt as u32 + 1));
+                        break;
+                    }
+                    None => {
+                        mesh.positions = poly.positions;
+                        mesh.faces = poly.faces;
+                        if fallback.is_none() {
+                            fallback = Some((pf, mesh, attempt as u32 + 1));
+                        }
+                    }
+                }
             }
             Err(e @ RetopoError::ExtractionInvalid(_)) => attempt_error = Some(e),
             Err(e) => return Err(e),
         }
     }
-    let Some((pf, mesh, extraction_attempts)) = solved else {
+    let Some((pf, mut mesh, extraction_attempts)) = solved.or(fallback) else {
         return Err(attempt_error.expect("at least one attempt ran"));
     };
+    // ---- polish: even out the spacing, staying on the input surface -----
+    {
+        let surface = cleanup::SurfaceIndex::new(&verts, &tris, 2.0 * pf.scale);
+        cleanup::relax(
+            &mut mesh.positions,
+            &mesh.faces,
+            &surface,
+            mirror,
+            RELAX_ITERATIONS,
+        );
+        if let (Some(plane), Some(image)) = (mirror, &mirror_image) {
+            symmetrize::enforce(&mut mesh.positions, image, plane);
+        }
+        let topo = extract::validate_closed_manifold(mesh.positions.len(), &mesh.faces)
+            .map_err(RetopoError::ExtractionInvalid)?;
+        if topo.euler != mesh.stats.euler_output
+            || mesh.positions.iter().flatten().any(|c| !c.is_finite())
+        {
+            return Err(RetopoError::ExtractionInvalid(
+                "polish broke the mesh".into(),
+            ));
+        }
+    }
     report(&mut progress, 0.97)?;
 
     let es = &mesh.stats;

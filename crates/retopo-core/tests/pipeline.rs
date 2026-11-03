@@ -122,10 +122,40 @@ fn symmetry_constraint_mirrors_the_result() {
     for out in [&auto, &x] {
         assert_eq!(check_closed_manifold(out), 2);
         assert!(
-            out.stats.symmetry_deviation < 0.1,
+            out.stats.symmetry_deviation < 0.01,
             "mirror deviation {} cells",
             out.stats.symmetry_deviation
         );
+    }
+    // X is exact: every vertex has a mirror image (plane x = 3), and the
+    // mirrored face set is the face set (same topology on both sides)
+    let pos: Vec<[f32; 3]> = x.positions.chunks(3).map(|v| [v[0], v[1], v[2]]).collect();
+    let tol = 1e-3 * x.stats.edge_length as f32;
+    let image: Vec<usize> = pos
+        .iter()
+        .map(|p| {
+            let q = [6.0 - p[0], p[1], p[2]];
+            (0..pos.len())
+                .min_by(|&a, &b| {
+                    let d = |k: usize| (0..3).map(|c| (pos[k][c] - q[c]).powi(2)).sum::<f32>();
+                    d(a).total_cmp(&d(b))
+                })
+                .filter(|&k| (0..3).all(|c| (pos[k][c] - q[c]).abs() < tol))
+                .unwrap_or_else(|| panic!("{p:?} has no mirror image"))
+        })
+        .collect();
+    let mut faces = std::collections::HashSet::new();
+    let mut off = 0;
+    for &n in &x.face_sizes {
+        let mut f: Vec<u32> = x.indices[off..off + n as usize].to_vec();
+        f.sort_unstable();
+        faces.insert(f);
+        off += n as usize;
+    }
+    for f in &faces {
+        let mut m: Vec<u32> = f.iter().map(|&v| image[v as usize] as u32).collect();
+        m.sort_unstable();
+        assert!(faces.contains(&m), "face {f:?} has no mirror image");
     }
 }
 
