@@ -80,7 +80,8 @@ class OpenRetopoStats(ctypes.Structure):
         ("symmetry_deviation_x", ctypes.c_double),
         ("edge_length", ctypes.c_double),
         ("duration_seconds", ctypes.c_double),
-        ("reserved", ctypes.c_uint64 * 4),
+        ("extraction_attempts", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 3),
     ]
 
 _STAT_FIELDS = [name for name, _ in OpenRetopoStats._fields_ if not name.startswith("_") and name not in ("struct_size", "reserved")]

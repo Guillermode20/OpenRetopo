@@ -122,6 +122,9 @@ pub struct RemeshStats {
     pub edge_length: f64,
     /// Vertices added by the pre-solve refinement.
     pub subdivision_vertices_added: u64,
+    /// Position-field/extraction attempts used (1 = first try; retries use
+    /// slightly different scales after a rejected extraction; 0 in decimate).
+    pub extraction_attempts: u64,
     pub duration_seconds: f64,
 }
 
@@ -382,18 +385,36 @@ fn field_aligned(
     let fopts = field::FieldOptions::default();
     let (orient, _) = field::solve_orientation(&verts, &tris, &fopts)?;
     report(&mut progress, 0.55)?;
-    let pf = field::solve_position(&verts, &tris, &orient, target, &fopts)?;
-    report(&mut progress, 0.80)?;
-
-    // ---- extraction (validates closed manifold + Euler invariance) -------
-    let mesh = extract::extract_mesh(
-        &verts,
-        &tris,
-        &orient.directions,
-        &orient.normals,
-        &pf.anchors,
-        pf.scale,
-    )?;
+    // The orientation field is scale-independent; the position field and
+    // extraction are not. At some lattice phases extraction tunnels through
+    // creases and the validator rejects the result (Euler/manifold check).
+    // Retry a few nearby scales deterministically before failing loudly.
+    const SCALE_STEPS: [f64; 5] = [1.0, 0.95, 1.05, 0.9, 1.1];
+    let mut attempt_error = None;
+    let mut solved = None;
+    for (attempt, m) in SCALE_STEPS.iter().enumerate() {
+        let t = ((target as f64) / (m * m)).round().max(1.0) as u32;
+        let pf = field::solve_position(&verts, &tris, &orient, t, &fopts)?;
+        report(&mut progress, 0.80)?; // also lets the host cancel between retries
+        match extract::extract_mesh(
+            &verts,
+            &tris,
+            &orient.directions,
+            &orient.normals,
+            &pf.anchors,
+            pf.scale,
+        ) {
+            Ok(mesh) => {
+                solved = Some((pf, mesh, attempt as u32 + 1));
+                break;
+            }
+            Err(e @ RetopoError::ExtractionInvalid(_)) => attempt_error = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    let Some((pf, mesh, extraction_attempts)) = solved else {
+        return Err(attempt_error.expect("at least one attempt ran"));
+    };
     report(&mut progress, 0.97)?;
 
     let es = &mesh.stats;
@@ -439,6 +460,7 @@ fn field_aligned(
             symmetry_deviation_x,
             edge_length: pf.scale,
             subdivision_vertices_added,
+            extraction_attempts: extraction_attempts as u64,
             duration_seconds: start.elapsed().as_secs_f64(),
             ..RemeshStats::default()
         },

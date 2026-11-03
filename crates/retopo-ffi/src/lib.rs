@@ -94,7 +94,8 @@ pub struct OpenRetopoStats {
     pub symmetry_deviation_x: f64,
     pub edge_length: f64,
     pub duration_seconds: f64,
-    pub reserved: [u64; 4],
+    pub extraction_attempts: u64,
+    pub reserved: [u64; 3],
 }
 
 impl OpenRetopoStats {
@@ -125,7 +126,8 @@ impl OpenRetopoStats {
             symmetry_deviation_x: s.symmetry_deviation_x,
             edge_length: s.edge_length,
             duration_seconds: s.duration_seconds,
-            reserved: [0; 4],
+            extraction_attempts: s.extraction_attempts,
+            reserved: [0; 3],
         }
     }
 }
